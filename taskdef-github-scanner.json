@@ -1,0 +1,30 @@
+{
+  "family": "github-scanner",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::767828720428:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::767828720428:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "scanner",
+      "image": "767828720428.dkr.ecr.us-east-1.amazonaws.com/github-scanner:latest",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/github-scanner",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "environment": [
+        {
+          "name": "PYTHONUNBUFFERED",
+          "value": "1"
+        }
+      ]
+    }
+  ]
+}

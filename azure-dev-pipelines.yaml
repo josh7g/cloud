@@ -1,0 +1,79 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- develop
+
+pool:
+  #name: TerraformAgent
+  vmImage: 'ubuntu-latest'
+ 
+
+variables:
+  AWS_REGION: 'us-east-1'  # Change to your AWS region
+  ECR_REPOSITORY: 'backend/repository-scanner'  # Change to your repository name
+  IMAGE_TAG: '$(Build.BuildId)'
+  AWS_CREDENTIAL: 'aws-infra-service-connection'
+  FULL_IMAGE_NAME: '$(ECR_REPOSITORY):$(IMAGE_TAG)'
+
+stages:
+# ------------------------------------------------------------------------
+# STAGE 1: SOURCE CODE SECURITY GATES (SAST & SECRETS)
+# ------------------------------------------------------------------------
+- stage: Security_Gates
+  displayName: Security Gates (SAST & Secrets)
+  jobs:
+  - job: Semgrep_Scan
+    displayName: Semgrep SAST & Secret Scan
+    steps:
+    # 1. Run Semgrep via Docker
+    # This scans for Code vulnerabilities (SAST) and Hardcoded Secrets.
+    # It fails the build (--error) if High severity issues are found.
+    - script: |
+        docker run --rm -v $(System.DefaultWorkingDirectory):/src returntocorp/semgrep \
+        semgrep scan --config=p/security-audit --config=p/secrets --config=p/owasp-top-ten \
+        --severity=ERROR --error \
+        --json --output=semgrep-report.json
+      displayName: 'Run Semgrep (SAST & Secrets)'
+      continueOnError: false # Strictly block pipeline on failure
+
+      # 3. Publish Results to Azure DevOps "Scans" Tab
+    # Note: Requires "SARIF SAST Scans Tab" extension
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)/semgrep-report.json'
+        ArtifactName: 'CodeAnalysisLogs'
+      displayName: 'Publish Security Report'
+      condition: always() # Publish report even if vulnerabilities are found
+
+
+- stage: Build_And_Push
+  displayName: Build and Push to ECR
+  jobs:
+  - job: BuildAndPush
+    displayName: Build Docker Image and Push to AWS ECR
+    steps:
+    - task: Docker@2
+      inputs:
+        repository: $(ECR_REPOSITORY)
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+      displayName: Build Docker Image
+      
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: $(AWS_CREDENTIAL)
+        regionName: $(AWS_REGION)
+        imageSource: 'imagename'
+        sourceImageName: $(ECR_REPOSITORY)
+        repositoryName: $(ECR_REPOSITORY)
+        autoCreateRepository: true
+        pushTag: $(IMAGE_TAG)
+      displayName: ECR Image Push
+    
+    

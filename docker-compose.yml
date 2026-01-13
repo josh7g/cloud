@@ -1,0 +1,41 @@
+services:
+  web:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "10000:10000"
+    environment:
+      - FLASK_ENV=development
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME}
+      - REDIS_URL=${REDIS_URL}
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY}
+      - SEMGREP_APP_TOKEN=${SEMGREP_APP_TOKEN}
+      - RAG_API_URL=${RAG_API_URL}
+      - RERANK_API_URL=${RERANK_API_URL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # Separate credentials for ECS/GitHub scanner deployment (main account)
+      - ECS_AWS_ACCESS_KEY_ID=${ECS_AWS_ACCESS_KEY_ID}
+      - ECS_AWS_SECRET_ACCESS_KEY=${ECS_AWS_SECRET_ACCESS_KEY}
+    networks:
+      - app-network
+    volumes:
+      - ./scripts:/home/steampipe/scripts:ro
+      # Use named volumes for persistent storage that won't override container content
+      - steampipe-data:/home/steampipe/.steampipe
+      - results-data:/app/results
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  steampipe-data:
+  results-data:

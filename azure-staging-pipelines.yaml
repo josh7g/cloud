@@ -1,0 +1,46 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- staging
+
+pool:
+  #name: TerraformAgent
+  vmImage: 'ubuntu-latest'
+ 
+
+variables:
+  AWS_REGION: 'us-east-1'  # Change to your AWS region
+  ECR_REPOSITORY: 'backend/repository-scanner'  # Change to your repository name
+  IMAGE_TAG: '$(Build.BuildId)'
+  AWS_CREDENTIAL: 'aws-staging-service-connection'
+
+stages:
+- stage: Build_And_Push
+  displayName: Build and Push to ECR
+  jobs:
+  - job: BuildAndPush
+    displayName: Build Docker Image and Push to AWS ECR
+    steps:
+    - task: Docker@2
+      inputs:
+        repository: $(ECR_REPOSITORY)
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        tags: latest
+      displayName: Build Docker Image
+      
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: $(AWS_CREDENTIAL)
+        regionName: $(AWS_REGION)
+        imageSource: 'imagename'
+        sourceImageName: $(ECR_REPOSITORY)
+        repositoryName: $(ECR_REPOSITORY)
+        autoCreateRepository: true
+        pushTag: $(IMAGE_TAG)
+      displayName: ECR Image Push
+    
+    

@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Semgrep
+RUN pip install --no-cache-dir semgrep
+
+# Copy requirements and install
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY scanner.py /app/
+COPY models.py /app/
+COPY db_utils.py /app/
+COPY progress_tracking.py /app/
+COPY ignore_utils.py /app/
+COPY github_scanner_task.py /app/
+
+# Run the scanner
+CMD ["python", "github_scanner_task.py"]
