@@ -187,17 +187,18 @@ RUN mkdir -p /home/steampipe/scripts && \
 USER root
 
 # Install Java and ZAP CLI
-# Install Java and ZAP CLI
 RUN apt-get update && \
     apt-get install -y openjdk-21-jre-headless wget && \
-    wget --no-check-certificate -O /tmp/ZAP_2.15.0_Linux.tar.gz https://github.com/zaproxy/zaproxy/releases/download/v2.15.0/ZAP_2.15.0_Linux.tar.gz && \
+    wget -O /tmp/ZAP_2.15.0_Linux.tar.gz https://github.com/zaproxy/zaproxy/releases/download/v2.15.0/ZAP_2.15.0_Linux.tar.gz && \
     mkdir -p /opt && \
     tar -xzf /tmp/ZAP_2.15.0_Linux.tar.gz -C /opt && \
     mv /opt/ZAP_* /opt/zap && \
     rm /tmp/ZAP_2.15.0_Linux.tar.gz && \
     chmod +x /opt/zap/zap.sh && \
     ln -s /opt/zap/zap.sh /usr/local/bin/zap.sh && \
-    ln -s /opt/zap/zap /usr/local/bin/zaproxy
+    ln -s /opt/zap/zap /usr/local/bin/zaproxy && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy the AWS connection update script
 COPY update_aws_connection.sh /home/steampipe/scripts/update_aws_connection.sh
