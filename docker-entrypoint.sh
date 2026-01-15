@@ -42,12 +42,25 @@ test_docker || echo "⚠️ Docker not fully functional - ZAP scans may fail"
 # Continue with application startup
 wait_for_database
 
-echo "Initializing application database (includes auto-migration)..."
-if [ -f create_tables.py ]; then
-    python create_tables.py
-    echo "✅ Database initialization completed"
+echo "Initializing application database with Alembic migrations..."
+if command -v alembic &> /dev/null; then
+    # Check if alembic_version table exists (means Alembic was used before)
+    if PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USERNAME -d $DB_NAME -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='alembic_version'" 2>/dev/null | grep -q 1; then
+        echo "Alembic version table exists, running migrations..."
+        alembic upgrade head
+    else
+        # Check if tables exist (old create_tables.py system)
+        if PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USERNAME -d $DB_NAME -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='analysis_results'" 2>/dev/null | grep -q 1; then
+            echo "Existing tables detected (from create_tables.py), stamping as baseline..."
+            alembic stamp head
+        else
+            echo "Fresh database detected, running initial migrations..."
+            alembic upgrade head
+        fi
+    fi
+    echo "✅ Database migrations completed"
 else
-    echo "⚠️ create_tables.py not found, skipping database initialization"
+    echo "⚠️ Alembic not found, skipping database migrations"
 fi
 
 # Ensure ZAP reports directory exists and is writable

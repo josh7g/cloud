@@ -1263,7 +1263,7 @@ class AWSCodeCommitScanner:
             # Initialize variables
             rag_responses = []
             semgrep_rag_response = None
-           
+
             # Send findings to semgrep RAG API
             update_scan_progress(
                 user_id,
@@ -1308,7 +1308,7 @@ class AWSCodeCommitScanner:
             rerank_data = {
                 "findings": [
                     {
-                        "ID": idx + 1,
+                        "id": idx + 1,
                         "file": finding["file"],
                         "code_snippet": finding["code_snippet"],
                         "message": finding["message"],
@@ -1334,30 +1334,37 @@ class AWSCodeCommitScanner:
             reordered_findings = all_findings.copy()
             if all_findings and rerank_api_url:
                 import aiohttp
-                rerank_data = [{"ID": f["ID"], "file": f.get("file"), "severity": f.get("severity","")} for f in all_findings]
+
+                rerank_data = [
+                    {
+                        "id": f.get("id"),
+                        "file": f.get("file"),
+                        "severity": f.get("severity", ""),
+                    }
+                    for f in all_findings
+                ]
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(rerank_api_url, json=rerank_data) as resp:
+                        async with session.post(
+                            rerank_api_url, json=rerank_data
+                        ) as resp:
                             if resp.status == 200:
                                 rerank_response = await resp.json()
-                                tuples = extract_rerank_tuples(rerank_response["llm_response"], all_findings)
+                                tuples = extract_rerank_tuples(
+                                    rerank_response["llm_response"], all_findings
+                                )
+                                logger.info(f"[CODECOMMIT] OBSERVING RERANKING RESPONSE: Tuples: {tuples}")
                                 if tuples:
-                                    id_to_finding = {f["ID"]: f.copy() for f in all_findings}
-                                    reordered_findings = {}
+                                    id_to_finding = {
+                                        f.get("id"): f.copy() for f in all_findings
+                                    }
                                     reordered_findings_list = []
                                     for t_id, sev in tuples:
                                         f = id_to_finding.get(t_id)
                                         if f:
                                             f["severity"] = sev
                                             reordered_findings_list.append(f)
-                                    reordered_findings["findings"] = reordered_findings_list
-                                    reordered_findings["stats"] = scan_results.get("stats", {})
-                                    reordered_findings["stats"]["severity_counts"] = {
-                                        "CRITICAL": len([f for f in reordered_findings_list if f["severity"] == "CRITICAL"]),
-                                        "HIGH": len([f for f in reordered_findings_list if f["severity"] == "HIGH"]),
-                                        "MEDIUM": len([f for f in reordered_findings_list if f["severity"] == "MEDIUM"]),
-                                        "LOW": len([f for f in reordered_findings_list if f["severity"] == "LOW"]),
-                                    }
+                                    reordered_findings = reordered_findings_list
                                 else:
                                     pass  # use original order
                 except Exception as e:
@@ -1367,9 +1374,11 @@ class AWSCodeCommitScanner:
 
             update_scan_progress(user_id, f"{region}/{repo_name}", "finalizing", 90)
 
+            # Ensure reordered_findings is a dict with 'findings' and 'stats' keys
+
             results_data = {
                 "findings": reordered_findings,
-                "stats": reordered_findings.get("stats", {}),
+                "stats": scan_results.get("stats", {}),
                 "metadata": {
                     "repository_name": repo_name,
                     "region": region,
@@ -1392,12 +1401,12 @@ class AWSCodeCommitScanner:
                     )
                     if analysis:
                         analysis.results = results_data  # All findings
-                        analysis.rerank = reordered_findings["findings"]  # Selected findings
+                        analysis.rerank = reordered_findings  # Selected findings
                         analysis.status = "completed"
                         analysis.completed_at = datetime.now()
                         self.db_session.commit()
                         logger.info(
-                            f"Successfully stored in database - results: {len(all_findings)}, rerank: {len(reordered_findings['findings'])}"
+                            f"Successfully stored in database - results: {len(all_findings)}, rerank: {len(reordered_findings.get('findings', []))}"
                         )
                 except Exception as e:
                     self.db_session.rollback()

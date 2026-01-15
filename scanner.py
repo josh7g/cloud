@@ -1435,6 +1435,7 @@ class SecurityScanner:
                                 rerank_response = await response.json()
                                 logger.info(f"OBSERVING RERANKING RESPONSE: Rerank response: {rerank_response}")
                                 tuples = extract_rerank_tuples(rerank_response.get("llm_response", ""), merged_findings)
+                                logger.info(f"[GITHUB] OBSERVING RERANKING RESPONSE: Tuples: {tuples}")
                                 if tuples:
                                     findings_by_id = {
                                         idx + 1: f

@@ -44,16 +44,16 @@ async def scan_azure_devops_repo(
 ):
     """
     Trigger a semgrep scan for an Azure Devops repo with incremental scanning support.
-    
+
     INCREMENTAL SCANNING:
     - If files_to_scan is provided: Only scan the specified changed files
     - If previous_findings is provided: Merge new findings with existing findings
     - If current_commit_sha is provided: Track the commit SHA for future incremental scans
-    
+
     MERGING LOGIC:
     - Keep findings from unchanged files (not in files_to_scan)
     - Replace findings from changed files (in files_to_scan) with new scan results
-    
+
     Args:
         PAT (str, optional): Personal Access Token for authentication
         access_token (str, optional): OAuth access token for authentication
@@ -943,7 +943,9 @@ class AzureSecurityScanner:
         )
         return configs
 
-    async def _run_semgrep_scan(self, target_dir: Path, scan_config: Dict, file_list: Optional[List[str]] = None) -> Dict:
+    async def _run_semgrep_scan(
+        self, target_dir: Path, scan_config: Dict, file_list: Optional[List[str]] = None
+    ) -> Dict:
         """Execute semgrep scan with enhanced error handling and monitoring"""
         semgrepignore_path = target_dir / ".semgrepignore"
         start_time = time.time()
@@ -975,13 +977,21 @@ class AzureSecurityScanner:
             if file_list:
                 # Incremental scan: scan only specific files
                 cmd.extend([str(Path(target_dir) / f) for f in file_list])
-                logger.critical(f"*** URGENT: Running Azure DevOps incremental Semgrep scan on {len(file_list)} files for config {scan_name}")
-                logger.debug(f"Azure DevOps incremental semgrep files: {file_list[:5]}{'...' if len(file_list) > 5 else ''}")
+                logger.critical(
+                    f"*** URGENT: Running Azure DevOps incremental Semgrep scan on {len(file_list)} files for config {scan_name}"
+                )
+                logger.debug(
+                    f"Azure DevOps incremental semgrep files: {file_list[:5]}{'...' if len(file_list) > 5 else ''}"
+                )
             else:
                 # Full scan: scan entire directory
                 cmd.append(str(target_dir))
-                logger.critical(f"*** URGENT: Running Azure DevOps full Semgrep scan for config {scan_name}")
-                logger.debug(f"Azure DevOps full semgrep: target_dir={target_dir}, config={scan_name}")
+                logger.critical(
+                    f"*** URGENT: Running Azure DevOps full Semgrep scan for config {scan_name}"
+                )
+                logger.debug(
+                    f"Azure DevOps full semgrep: target_dir={target_dir}, config={scan_name}"
+                )
 
             memory_before = psutil.Process().memory_info().rss / (1024 * 1024)
             logger.info(f"Memory usage before {scan_name}: {memory_before:.2f}MB")
@@ -1049,7 +1059,9 @@ class AzureSecurityScanner:
             if semgrepignore_path.exists():
                 semgrepignore_path.unlink()
 
-    async def run_multiple_semgrep_scans(self, target_dir: Path, files_to_scan: Optional[list] = None) -> Dict:
+    async def run_multiple_semgrep_scans(
+        self, target_dir: Path, files_to_scan: Optional[list] = None
+    ) -> Dict:
         """Run multiple semgrep scans based on detected language"""
         try:
             logger.info(f"Detected repository language: {self.detected_language}")
@@ -1084,7 +1096,9 @@ class AzureSecurityScanner:
                     logger.info(
                         f"Starting scan with config: {scan_config['name']} ({scan_config['rules_count']} rules)"
                     )
-                    result = await self._run_semgrep_scan(target_dir, scan_config, files_to_scan)
+                    result = await self._run_semgrep_scan(
+                        target_dir, scan_config, files_to_scan
+                    )
                     all_results.append(result)
 
                     findings = result.get("findings", [])
@@ -1477,9 +1491,15 @@ class AzureSecurityScanner:
 
             # SCAN: if files_to_scan is set, restrict scans
             if files_to_scan:
+
                 def file_filter(path):
                     norm_candidates = [path, path.lstrip("/")]
-                    return any(norm_path in (f.lstrip("/")) for norm_path in norm_candidates for f in files_to_scan)
+                    return any(
+                        norm_path in (f.lstrip("/"))
+                        for norm_path in norm_candidates
+                        for f in files_to_scan
+                    )
+
             else:
                 file_filter = None
 
@@ -1493,8 +1513,12 @@ class AzureSecurityScanner:
 
             # Initial scan
             if files_to_scan:
-                logger.critical(f"*** URGENT: Running Azure DevOps incremental scan on {len(files_to_scan)} changed files")
-                logger.debug(f"Azure DevOps incremental scan files: {files_to_scan[:10]}{'...' if len(files_to_scan) > 10 else ''}")
+                logger.critical(
+                    f"*** URGENT: Running Azure DevOps incremental scan on {len(files_to_scan)} changed files"
+                )
+                logger.debug(
+                    f"Azure DevOps incremental scan files: {files_to_scan[:10]}{'...' if len(files_to_scan) > 10 else ''}"
+                )
                 scan_results = (
                     await self.run_multiple_semgrep_scans(self.repo_dir, files_to_scan)
                     if multi_scan
@@ -1503,8 +1527,12 @@ class AzureSecurityScanner:
                     )
                 )
             else:
-                logger.critical(f"*** URGENT: Running Azure DevOps full scan on entire repository")
-                logger.debug(f"Azure DevOps full scan: repo_dir={self.repo_dir}, multi_scan={multi_scan}")
+                logger.critical(
+                    f"*** URGENT: Running Azure DevOps full scan on entire repository"
+                )
+                logger.debug(
+                    f"Azure DevOps full scan: repo_dir={self.repo_dir}, multi_scan={multi_scan}"
+                )
                 scan_results = (
                     await self.run_multiple_semgrep_scans(self.repo_dir)
                     if multi_scan
@@ -1526,13 +1554,23 @@ class AzureSecurityScanner:
                 # Incremental scan: merge with previous findings
                 # Keep findings from unchanged files, replace findings from changed files
                 changed_set = set(files_to_scan)
-                unchanged_findings = [f for f in previous_findings if f.get("file") not in changed_set]
+                unchanged_findings = [
+                    f for f in previous_findings if f.get("file") not in changed_set
+                ]
                 merged_findings = unchanged_findings + all_findings
-                logger.critical(f"*** URGENT: Azure DevOps incremental scan merged findings: {len(unchanged_findings)} old findings kept, {len(all_findings)} new findings added")
-                logger.debug(f"Azure DevOps merge details: changed_files={len(files_to_scan)}, previous_findings={len(previous_findings)}, merged_total={len(merged_findings)}")
+                logger.critical(
+                    f"*** URGENT: Azure DevOps incremental scan merged findings: {len(unchanged_findings)} old findings kept, {len(all_findings)} new findings added"
+                )
+                logger.debug(
+                    f"Azure DevOps merge details: changed_files={len(files_to_scan)}, previous_findings={len(previous_findings)}, merged_total={len(merged_findings)}"
+                )
             else:
-                logger.critical(f"*** URGENT: Azure DevOps scan using {len(all_findings)} current findings (no previous findings or no changed files)")
-                logger.debug(f"Azure DevOps scan details: files_to_scan={files_to_scan is not None}, previous_findings={previous_findings is not None}")
+                logger.critical(
+                    f"*** URGENT: Azure DevOps scan using {len(all_findings)} current findings (no previous findings or no changed files)"
+                )
+                logger.debug(
+                    f"Azure DevOps scan details: files_to_scan={files_to_scan is not None}, previous_findings={previous_findings is not None}"
+                )
 
             all_findings = merged_findings
 
@@ -1600,7 +1638,7 @@ class AzureSecurityScanner:
             rerank_data = {
                 "findings": [
                     {
-                        "ID": idx + 1,
+                        "id": idx + 1,
                         "file": finding["file"],
                         "code_snippet": finding["code_snippet"],
                         "message": finding["message"],
@@ -1627,36 +1665,45 @@ class AzureSecurityScanner:
             reordered_findings = merged_findings.copy()
             if merged_findings and AI_RERANK_URL:
                 import aiohttp
+
                 logger.info(f"Sending {len(merged_findings)} findings for reranking")
-                rerank_data = [{"ID": f["ID"], "file": f.get("file"), "severity": f.get("severity","")} for f in merged_findings]
+                rerank_data = [
+                    {
+                        "id": f.get("id"),
+                        "file": f.get("file"),
+                        "severity": f.get("severity", ""),
+                    }
+                    for f in merged_findings
+                ]
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(AI_RERANK_URL, json=rerank_data) as resp:
+                        async with session.post(
+                            AI_RERANK_URL, json=rerank_data
+                        ) as resp:
                             if resp.status == 200:
                                 rerank_response = await resp.json()
-                                logger.info(f"OBSERVING RERANKING RESPONSE: Rerank response: {rerank_response}")
-                                tuples = extract_rerank_tuples(rerank_response["llm_response"], merged_findings)
+                                logger.info(
+                                    f"OBSERVING RERANKING RESPONSE: Rerank response: {rerank_response}"
+                                )
+                                tuples = extract_rerank_tuples(
+                                    rerank_response["llm_response"], merged_findings
+                                )
+                                logger.info(f"[AZURE DEVOPS] OBSERVING RERANKING RESPONSE: Tuples: {tuples}")
                                 if tuples:
-                                    id_to_finding = {f["ID"]: f.copy() for f in merged_findings}
-                                    reordered_findings = {}
+                                    id_to_finding = {
+                                        f.get("id"): f.copy() for f in merged_findings
+                                    }
                                     reordered_findings_list = []
                                     for t_id, sev in tuples:
                                         f = id_to_finding.get(t_id)
                                         if f:
                                             f["severity"] = sev
                                             reordered_findings_list.append(f)
-                                    reordered_findings["findings"] = reordered_findings_list
-                                    reordered_findings["stats"] = scan_results.get("stats", {})
-                                    reordered_findings["stats"]["severity_counts"] = {
-                                        "CRITICAL": len([f for f in reordered_findings_list if f["severity"] == "CRITICAL"]),
-                                        "HIGH": len([f for f in reordered_findings_list if f["severity"] == "HIGH"]),
-                                        "MEDIUM": len([f for f in reordered_findings_list if f["severity"] == "MEDIUM"]),
-                                        "LOW": len([f for f in reordered_findings_list if f["severity"] == "LOW"]),
-                                    }
+                                    reordered_findings = reordered_findings_list
                                 else:
-                                    pass 
+                                    pass
                 except Exception as e:
-                    pass  
+                    pass
             else:
                 logger.info("No findings to rerank")
 
@@ -1666,7 +1713,7 @@ class AzureSecurityScanner:
 
             results_data = {
                 "findings": reordered_findings,
-                "stats": reordered_findings.get("stats", {}),
+                "stats": scan_results.get("stats", {}),
                 "metadata": {
                     "repository_url": f"https://dev.azure.com/{quote(organization_name)}/{quote(project_name)}/_apis/git/repositories/{quote(repo_name)}",
                     "user_id": user_id,
@@ -1695,8 +1742,12 @@ class AzureSecurityScanner:
                         if current_commit_sha:
                             analysis.scanned_commit_sha = current_commit_sha
                         self.db_session.commit()
-                        logger.critical(f"*** URGENT: Azure DevOps scan results stored in database - results: {len(all_findings)}, rerank: {len(reordered_findings)}, commit_sha: {current_commit_sha}")
-                        logger.debug(f"Azure DevOps database update: analysis_id={self.analysis_id}, status=completed, findings_count={len(all_findings)}")
+                        logger.critical(
+                            f"*** URGENT: Azure DevOps scan results stored in database - results: {len(all_findings)}, rerank: {len(reordered_findings)}, commit_sha: {current_commit_sha}"
+                        )
+                        logger.debug(
+                            f"Azure DevOps database update: analysis_id={self.analysis_id}, status=completed, findings_count={len(all_findings)}"
+                        )
                 except Exception as e:
                     self.db_session.rollback()
                     logger.error(f"Database update failed: {str(e)}")

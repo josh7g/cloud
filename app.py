@@ -43,12 +43,17 @@ from aws_api import aws_bp
 import random
 from models import db, AnalysisResult, IgnoredFinding
 from azure_devops.azure_devops_api import azure_devops_bp
+from v2_api import v2_api_bp
 from gitlab_api import gitlab_bp
 from zap_api import zap_bp
 from sse_progress import sse_bp  # SSE for real-time progress streaming
 
 # from codecommit_api import codecommit_bp
 from codecommit.codecommit_api import codecommit_bp
+
+# Unified Cloud Scanner API
+from cloud_scanner.unified_api import UnifiedCloudAPI
+from cloud_scanner.providers.aws.aws_api import register_aws_provider
 
 # Configure logging
 logging.basicConfig(
@@ -145,28 +150,13 @@ def _auto_backfill_workspaces():
                 f"🔄 Found {count} records needing workspace backfill, starting process..."
             )
 
-        # Run backfill
-        from create_tables import backfill_workspace_ids
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        try:
-            success = loop.run_until_complete(backfill_workspace_ids())
-
-            if success:
-                logger.info("✅ Automatic workspace backfill completed successfully")
-            else:
-                logger.warning(
-                    "⚠️ Workspace backfill completed with errors (check logs)"
-                )
-
-        except Exception as backfill_error:
-            logger.error(f"❌ Workspace backfill failed: {str(backfill_error)}")
-            # Don't crash the app if backfill fails
-
-        finally:
-            loop.close()
+        # NOTE: Workspace backfill functionality removed
+        # This was part of the old migration system
+        # If needed, create a new Alembic migration for workspace backfill
+        logger.info(f"🔄 Found {count} records needing workspace backfill")
+        logger.info(
+            "ℹ️  To backfill workspaces, create a data migration using: python migrate.py create 'backfill workspaces'"
+        )
 
     except Exception as e:
         logger.error(f"Error during auto-backfill check: {str(e)}")
@@ -322,7 +312,15 @@ pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Configure CORS for all routes including blueprints
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "workspace-id", "organization-id", "accesstoken", "accessToken"],
+        "max_age": 3600
+    }
+}, supports_credentials=False)
 
 
 socketio = SocketIO(
@@ -348,12 +346,22 @@ cache = Cache(
 cache.init_app(app)
 app.cache = cache
 
+register_aws_provider()
+# register_azure_provider()  
+# register_gcp_provider()    
+
+# unified cloud API at /api/v1/cloud/*
+unified_cloud_api = UnifiedCloudAPI()
+cloud_bp = unified_cloud_api.get_blueprint()
+app.register_blueprint(cloud_bp, url_prefix='/api/v1/cloud')
+
 # Register blueprints
 app.register_blueprint(progress_bp)
 app.register_blueprint(api, name="api_main")
 app.register_blueprint(analysis_bp, name="analysis_main")
-app.register_blueprint(aws_bp, name="aws_main")
+app.register_blueprint(aws_bp, name="aws_main")  # Keep for backward compatibility
 app.register_blueprint(azure_devops_bp, name="azure_devops")
+app.register_blueprint(v2_api_bp, name="v2_api")
 app.register_blueprint(gitlab_bp, name="gitlab_main")
 app.register_blueprint(zap_bp, name="zap_main")
 app.register_blueprint(sse_bp, name="sse_main")  # SSE for progress streaming
@@ -937,7 +945,7 @@ def handle_gitlab_subscribe(data):
 @socketio.on("subscribe_to_zap_scan")
 def handle_zap_subscribe(data):
     """
-     ZAP scan subscription handler 
+    ZAP scan subscription handler
     """
     try:
         sid = request.sid
@@ -1793,8 +1801,7 @@ db.init_app(app)
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-# Database initialization
-# Database initialization
+# Database initialization (minimal, no Alembic)
 with app.app_context():
     try:
 
@@ -1868,7 +1875,7 @@ with app.app_context():
 
                 logger.info("Database initialization completed successfully")
 
-                # ✅ ADD THIS LINE HERE - Call auto-backfill after initialization
+                # Call auto-backfill after initialization
                 _auto_backfill_workspaces()
 
                 return True
@@ -1889,7 +1896,6 @@ with app.app_context():
                     logger.error(
                         f"Failed to initialize database after {max_attempts} attempts: {str(e)}"
                     )
-
                     logger.warning(
                         "Starting app without database initialization for emergency recovery"
                     )
@@ -1903,7 +1909,6 @@ with app.app_context():
 
     except Exception as e:
         logger.error(f"Critical database initialization error: {str(e)}")
-
         logger.warning("App starting in emergency mode without database")
 
 
@@ -1933,8 +1938,7 @@ def create_app():
 
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
+    # Migrations are handled by init_db_with_alembic() during app context initialization
 
     port = int(os.getenv("PORT", 10000))
     socketio.run(app, host="0.0.0.0", port=port, debug=True, use_reloader=False)

@@ -145,6 +145,7 @@ class CloudScan(db.Model):
     findings = db.Column(JSONB)
     rerank = db.Column(JSONB)
     error = db.Column(db.Text)
+    workspace_id = db.Column(db.String(24), nullable=True)  # Workspace ID for multi-tenant support
 
     # Indexes for efficient lookups
     __table_args__ = (
@@ -159,6 +160,15 @@ class CloudScan(db.Model):
         ),
         db.Index("idx_cloud_scans_provider", "cloud_provider"),
         db.Index("idx_cloud_scans_status", "status"),
+        # Workspace indexes for efficient filtering
+        db.Index("idx_cloud_scans_workspace_id", "workspace_id"),
+        db.Index("idx_cloud_scans_user_workspace", "user_id", "workspace_id"),
+        db.Index(
+            "idx_cloud_scans_user_workspace_cloudname",
+            "user_id",
+            "workspace_id",
+            "cloudname",
+        ),
     )
 
     def to_dict(self):
@@ -177,6 +187,9 @@ class CloudScan(db.Model):
             "findings": self.findings,
             "rerank": self.rerank,
             "error": self.error,
+            "workspace_id": (
+                str(self.workspace_id) if self.workspace_id else None
+            ),  # Include workspace_id in response
         }
 
 
@@ -588,4 +601,74 @@ class RepositoryScanResult(db.Model):
             "results": self.results,
             "error": self.error,
             "rerank": self.rerank,
+        }
+
+
+class RepoScanResult(db.Model):
+    """
+    Unified repository scan model for all repository types.
+    Stores scan metadata without credentials.
+    """
+
+    __tablename__ = "repo_scan_results"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # User context
+    user_id = db.Column(db.String(255), nullable=False)
+    workspace_id = db.Column(db.String(24), nullable=True)
+
+    # Repository information (no credentials stored)
+    repo_type = db.Column(
+        db.String(50), nullable=False
+    )  # github, gitlab, azure-devops, codecommit
+    org_name = db.Column(db.String(255), nullable=False)
+    repo_name = db.Column(db.String(255), nullable=False)
+    project_name = db.Column(db.String(255), nullable=True)  # For Azure DevOps
+    hosted_git_url = db.Column(
+        db.String(512), nullable=True
+    )  # Custom/self-hosted Git URL
+
+    # Scan metadata
+    timestamp = db.Column(db.DateTime, default=datetime.now(timezone.utc))
+    status = db.Column(
+        db.String(50), default="pending"
+    )  # pending, in_progress, completed, error
+    results = db.Column(JSONB)
+    error = db.Column(db.Text)
+    rerank = db.Column(JSONB)
+    scanned_commit_sha = db.Column(db.String(64), nullable=True)
+
+    # Indexes for efficient lookups
+    __table_args__ = (
+        db.Index(
+            "idx_unified_repo_type_org_repo", "repo_type", "org_name", "repo_name"
+        ),
+        db.Index("idx_unified_user_workspace", "user_id", "workspace_id"),
+        db.Index("idx_unified_user_repo_type", "user_id", "repo_type"),
+        db.Index("idx_unified_workspace_id", "workspace_id"),
+        db.Index("idx_unified_status", "status"),
+        db.Index("idx_unified_timestamp", "timestamp"),
+        db.Index(
+            "idx_unified_org_project_repo", "org_name", "project_name", "repo_name"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "workspace_id": str(self.workspace_id) if self.workspace_id else None,
+            "repo_type": self.repo_type,
+            "org_name": self.org_name,
+            "repo_name": self.repo_name,
+            "project_name": self.project_name,
+            "hosted_git_url": self.hosted_git_url,
+            "branch_name": self.branch_name,
+            "timestamp": self.timestamp.isoformat(),
+            "status": self.status,
+            "results": self.results,
+            "error": self.error,
+            "rerank": self.rerank,
+            "scanned_commit_sha": self.scanned_commit_sha,
         }

@@ -3,6 +3,7 @@ Server-Sent Events (SSE) Progress Streaming
 Replacement for WebSocket-based progress tracking
 """
 from flask import Blueprint, Response, stream_with_context
+from urllib.parse import unquote
 import json
 import logging
 import time
@@ -18,7 +19,7 @@ def format_sse_message(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-@sse_bp.route("/scan/<user_id>/<repo_name>")
+@sse_bp.route("/scan/<user_id>/<path:repo_name>")
 def stream_scan_progress(user_id, repo_name):
     """
     Stream scan progress updates using Server-Sent Events.
@@ -33,6 +34,9 @@ def stream_scan_progress(user_id, repo_name):
             updateProgressBar(progress.o); // overall progress
         };
     """
+    # URL decode the repo_name to handle encoded slashes (owner%2Frepo -> owner/repo)
+    repo_name = unquote(repo_name)
+    
     @stream_with_context
     def generate():
         redis_client = None
@@ -123,9 +127,12 @@ def stream_scan_progress(user_id, repo_name):
     )
 
 
-@sse_bp.route("/aws/<user_id>/<account_id>")
+@sse_bp.route("/aws/<user_id>/<path:account_id>")
 def stream_aws_scan_progress(user_id, account_id):
     """Stream AWS scan progress"""
+    # URL decode the account_id to handle encoded slashes
+    account_id = unquote(account_id)
+    
     @stream_with_context
     def generate():
         redis_client = None
@@ -154,7 +161,7 @@ def stream_aws_scan_progress(user_id, account_id):
                         
                         if (data.get('user_id') == user_id and 
                             data.get('repo_name') == account_id and
-                            data.get('scan_type') == 'aws'):
+                            data.get('scan_type') == 'codecommit'):
                             
                             progress_data = data.get('data', {})
                             stage = progress_data.get('s', '')
@@ -200,9 +207,12 @@ def stream_aws_scan_progress(user_id, account_id):
     )
 
 
-@sse_bp.route("/gitlab/<user_id>/<project_id>")
+@sse_bp.route("/gitlab/<user_id>/<path:project_id>")
 def stream_gitlab_scan_progress(user_id, project_id):
     """Stream GitLab scan progress"""
+    # URL decode the project_id to handle encoded characters
+    project_id = unquote(project_id)
+    
     @stream_with_context
     def generate():
         redis_client = None
@@ -277,9 +287,12 @@ def stream_gitlab_scan_progress(user_id, project_id):
     )
 
 
-@sse_bp.route("/zap/<user_id>/<target_url_hash>")
+@sse_bp.route("/zap/<user_id>/<path:target_url_hash>")
 def stream_zap_scan_progress(user_id, target_url_hash):
     """Stream ZAP scan progress"""
+    # URL decode the target_url_hash to handle encoded characters
+    target_url_hash = unquote(target_url_hash)
+    
     @stream_with_context
     def generate():
         redis_client = None
@@ -307,7 +320,7 @@ def stream_zap_scan_progress(user_id, target_url_hash):
                         data = json.loads(message['data'])
                         
                         if (data.get('user_id') == user_id and 
-                            data.get('repo_name') == target_url_hash and
+                            data.get('resource_id') == target_url_hash and
                             data.get('scan_type') == 'zap'):
                             
                             progress_data = data.get('data', {})

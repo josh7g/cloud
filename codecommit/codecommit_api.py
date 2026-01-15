@@ -1623,6 +1623,9 @@ def get_codecommit_repository_branches():
             )
             branch_names = branches_response.get("branches", [])
 
+            # Filter out branches that start with 'rezliant-fix' prefix
+            branch_names = [b for b in branch_names if not b.startswith("rezliant-fix")]
+
             # Check if 'rezliant' branch exists, if not create it from default branch
             if "rezliant" not in branch_names:
                 logger.info(
@@ -1796,6 +1799,7 @@ def create_codecommit_pull_request():
             notification_rule_name = f"rezliant-pr-events-{repo_name}"
 
             # Check if notification rule already exists
+            notification_rule_exists = False
             try:
                 codestar_client = boto3.client(
                     "codestar-notifications",
@@ -1821,7 +1825,8 @@ def create_codecommit_pull_request():
                         logger.info(
                             f"Notification rule already exists for repository {repo_name}"
                         )
-                        return (True, webhook_url, None)
+                        notification_rule_exists = True
+                        break
 
             except Exception as check_error:
                 logger.warning(
@@ -1858,23 +1863,46 @@ def create_codecommit_pull_request():
                 )
                 logger.info(f"Set SNS topic policy to allow CodeStar Notifications")
 
-                # Subscribe HTTPS endpoint to SNS topic
-                subscription_response = sns_client.subscribe(
-                    TopicArn=topic_arn,
-                    Protocol="https",
-                    Endpoint=webhook_url,
-                    ReturnSubscriptionArn=True,
+                # Check existing subscriptions to see if webhook URL already exists
+                subscriptions = sns_client.list_subscriptions_by_topic(
+                    TopicArn=topic_arn
                 )
-                subscription_arn = subscription_response["SubscriptionArn"]
-                logger.info(f"Created SNS subscription: {subscription_arn}")
+                existing_webhook_subscription = None
+                webhook_subscription_exists = False
 
-                # Set subscription attributes for authentication
-                if webhook_username and webhook_password:
-                    # Note: SNS doesn't directly support basic auth, but we can use attributes
-                    # The webhook endpoint will need to validate the SNS signature instead
+                for sub in subscriptions.get("Subscriptions", []):
+                    if sub["Protocol"] == "https":
+                        if sub["Endpoint"] == webhook_url:
+                            webhook_subscription_exists = True
+                            existing_webhook_subscription = sub
+                            logger.info(
+                                f"Webhook subscription already exists with correct URL: {webhook_url}"
+                            )
+                            break
+
+                # Only create a new subscription if the current webhook URL doesn't exist
+                if not webhook_subscription_exists:
                     logger.info(
-                        "SNS subscription created (auth handled via SNS signature)"
+                        f"Creating new webhook subscription for URL: {webhook_url}"
                     )
+                    subscription_response = sns_client.subscribe(
+                        TopicArn=topic_arn,
+                        Protocol="https",
+                        Endpoint=webhook_url,
+                        ReturnSubscriptionArn=True,
+                    )
+                    subscription_arn = subscription_response["SubscriptionArn"]
+                    logger.info(f"Created SNS subscription: {subscription_arn}")
+
+                    # Set subscription attributes for authentication
+                    if webhook_username and webhook_password:
+                        # Note: SNS doesn't directly support basic auth, but we can use attributes
+                        # The webhook endpoint will need to validate the SNS signature instead
+                        logger.info(
+                            "SNS subscription created (auth handled via SNS signature)"
+                        )
+                else:
+                    logger.info("Using existing webhook subscription")
 
             except sns_client.exceptions.TopicLimitExceededException:
                 # Topic might already exist, try to get it
@@ -1911,39 +1939,77 @@ def create_codecommit_pull_request():
                 )
                 logger.info(f"Updated SNS topic policy to allow CodeStar Notifications")
 
-            # Create notification rule using AWS CodeStar Notifications
-            try:
-                notification_response = codestar_client.create_notification_rule(
-                    Name=notification_rule_name,
-                    EventTypeIds=[
-                        "codecommit-repository-pull-request-status-changed",
-                        "codecommit-repository-pull-request-merged",
-                    ],
-                    Resource=repo_arn,
-                    Targets=[
-                        {
-                            "TargetType": "SNS",
-                            "TargetAddress": topic_arn,
-                        }
-                    ],
-                    DetailType="FULL",
-                    Status="ENABLED",
+                # Check existing subscriptions to see if webhook URL already exists
+                subscriptions = sns_client.list_subscriptions_by_topic(
+                    TopicArn=topic_arn
                 )
+                existing_webhook_subscription = None
+                webhook_subscription_exists = False
 
-                logger.info(
-                    f"Notification rule created successfully: {notification_response['Arn']}"
-                )
-                return (True, webhook_url, None)
+                for sub in subscriptions.get("Subscriptions", []):
+                    if sub["Protocol"] == "https":
+                        if sub["Endpoint"] == webhook_url:
+                            webhook_subscription_exists = True
+                            existing_webhook_subscription = sub
+                            logger.info(
+                                f"Webhook subscription already exists with correct URL: {webhook_url}"
+                            )
+                            break
 
-            except Exception as notification_error:
-                logger.warning(
-                    f"Failed to create notification rule: {str(notification_error)}"
-                )
-                return (
-                    False,
-                    None,
-                    f"Failed to create notification rule: {str(notification_error)}",
-                )
+                # Only create a new subscription if the current webhook URL doesn't exist
+                if not webhook_subscription_exists:
+                    logger.info(
+                        f"Creating new webhook subscription for existing topic with URL: {webhook_url}"
+                    )
+                    subscription_response = sns_client.subscribe(
+                        TopicArn=topic_arn,
+                        Protocol="https",
+                        Endpoint=webhook_url,
+                        ReturnSubscriptionArn=True,
+                    )
+                    subscription_arn = subscription_response["SubscriptionArn"]
+                    logger.info(f"Created SNS subscription: {subscription_arn}")
+                else:
+                    logger.info("Using existing webhook subscription on existing topic")
+
+            # Create notification rule using AWS CodeStar Notifications (only if it doesn't exist)
+            if not notification_rule_exists:
+                try:
+                    notification_response = codestar_client.create_notification_rule(
+                        Name=notification_rule_name,
+                        EventTypeIds=[
+                            "codecommit-repository-pull-request-status-changed",
+                            "codecommit-repository-pull-request-merged",
+                        ],
+                        Resource=repo_arn,
+                        Targets=[
+                            {
+                                "TargetType": "SNS",
+                                "TargetAddress": topic_arn,
+                            }
+                        ],
+                        DetailType="FULL",
+                        Status="ENABLED",
+                    )
+
+                    logger.info(
+                        f"Notification rule created successfully: {notification_response['Arn']}"
+                    )
+
+                except Exception as notification_error:
+                    logger.warning(
+                        f"Failed to create notification rule: {str(notification_error)}"
+                    )
+                    return (
+                        False,
+                        None,
+                        f"Failed to create notification rule: {str(notification_error)}",
+                    )
+            else:
+                logger.info(f"Notification rule already exists, skipping creation")
+
+            # Return success after ensuring webhook subscription exists
+            return (True, webhook_url, None)
 
         except Exception as e:
             logger.warning(f"Error ensuring webhook exists: {str(e)}", exc_info=True)
@@ -1980,7 +2046,7 @@ def create_codecommit_pull_request():
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        default_branch_name = f"fix/{file_path.replace('/', '-')}-{timestamp}"
+        default_branch_name = f"rezliant-fix/{file_path.replace('/', '-')}-{timestamp}"
         new_branch = request_data.get("new_branch", default_branch_name)
         commit_message = request_data.get(
             "commit_message", f"Fix vulnerability in {file_path}"

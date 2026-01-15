@@ -914,49 +914,61 @@ class GitLabSecurityScanner:
             reordered_findings = all_findings.copy()
             if all_findings and rerank_api_url:
                 import aiohttp
+
                 logger.info(f"Sending {len(all_findings)} findings for reranking")
-                rerank_data = [{"ID": f["ID"], "file": f.get("file"), "severity": f.get("severity")} for f in all_findings]
+                rerank_data = [
+                    {
+                        "id": f.get("id"),
+                        "file": f.get("file"),
+                        "severity": f.get("severity"),
+                    }
+                    for f in all_findings
+                ]
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(rerank_api_url, json=rerank_data, timeout=30) as resp:
+                        async with session.post(
+                            rerank_api_url, json=rerank_data, timeout=30
+                        ) as resp:
                             if resp.status == 200:
                                 rerank_response = await resp.json()
-                                logger.info(f"OBSERVING RERANKING RESPONSE: Rerank response: {rerank_response}")
-                                tuples = extract_rerank_tuples(rerank_response["llm_response"], all_findings)
+                                logger.info(
+                                    f"OBSERVING RERANKING RESPONSE: Rerank response: {rerank_response}"
+                                )
+                                tuples = extract_rerank_tuples(
+                                    rerank_response["llm_response"], all_findings
+                                )
+                                logger.info(f"[GITLAB] OBSERVING RERANKING RESPONSE: Tuples: {tuples}")
                                 if tuples:
-                                    id_to_finding = {f["ID"]: f.copy() for f in all_findings}
-                                    reordered_findings = {}
+                                    id_to_finding = {
+                                        f.get("id"): f.copy() for f in all_findings
+                                    }
                                     reordered_findings_list = []
                                     for t_id, sev in tuples:
                                         f = id_to_finding.get(t_id)
                                         if f:
                                             f["severity"] = sev
                                             reordered_findings_list.append(f)
-                                    reordered_findings["findings"] = reordered_findings_list
-                                    reordered_findings["stats"] = scan_results.get("stats", {})
-                                    reordered_findings["stats"]["severity_counts"] = {
-                                        "CRITICAL": len([f for f in reordered_findings_list if f["severity"] == "CRITICAL"]),
-                                        "HIGH": len([f for f in reordered_findings_list if f["severity"] == "HIGH"]),
-                                        "MEDIUM": len([f for f in reordered_findings_list if f["severity"] == "MEDIUM"]),
-                                        "LOW": len([f for f in reordered_findings_list if f["severity"] == "LOW"]),
-                                    }
-                                    logger.info(f"Applied rerank tuple ordering/severity to findings. IDs: {[t_id for t_id, _ in tuples]}")
+                                    reordered_findings = reordered_findings_list
+                                    logger.info(
+                                        f"Applied rerank tuple ordering/severity to findings. IDs: {[t_id for t_id, _ in tuples]}"
+                                    )
                                 else:
-                                    logger.warning("Rerank tuple output invalid/empty, using original order")
+                                    logger.warning(
+                                        "Rerank tuple output invalid/empty, using original order"
+                                    )
                             else:
-                                logger.error(f"Reranker API error: status={resp.status}")
+                                logger.error(
+                                    f"Reranker API error: status={resp.status}"
+                                )
                 except Exception as e:
                     logger.error(f"Reranker integration error: {e}")
 
             # Add IDs to findings if needed
-            for idx, finding in enumerate(reordered_findings, 1):
-                if "ID" not in finding:
-                    finding["ID"] = idx
 
             # Prepare complete results data
             results_data = {
                 "findings": reordered_findings,
-                "stats": reordered_findings.get("stats", {}),
+                "stats": scan_results.get("stats", {}),
                 "metadata": {
                     "repository_url": project_url,
                     "project_id": project_id,

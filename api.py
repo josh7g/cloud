@@ -2948,6 +2948,13 @@ def get_repository_branches():
 
                     branches_data = await response.json()
 
+                    # Filter out branches that start with 'rezliant-fix' prefix
+                    branches_data = [
+                        b
+                        for b in branches_data
+                        if not b.get("name", "").startswith("rezliant-fix")
+                    ]
+
                     # Check if 'rezliant' branch exists, if not create it from default branch
                     branch_names = [branch["name"] for branch in branches_data]
                     if "rezliant" not in branch_names:

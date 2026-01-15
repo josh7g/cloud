@@ -2170,6 +2170,9 @@ def get_gitlab_repository_branches():
                     # Extract branch names
                     branch_names = [branch.get("name") for branch in branches_data]
 
+                    # Filter out branches that start with 'rezliant-fix' prefix
+                    branch_names = [b for b in branch_names if not b.startswith('rezliant-fix')]
+
                     # Check if 'rezliant' branch exists, if not create it from default branch
                     if "rezliant" not in branch_names:
                         logger.info(
@@ -2430,7 +2433,7 @@ def create_gitlab_merge_request():
 
         # Optional parameters with defaults
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        default_branch_name = f"fix/{file_path.replace('/', '-')}-{timestamp}"
+        default_branch_name = f"rezliant-fix/{file_path.replace('/', '-')}-{timestamp}"
         new_branch = request_data.get("new_branch", default_branch_name)
         commit_message = request_data.get(
             "commit_message", f"Fix vulnerability in {file_path}"

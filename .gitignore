@@ -99,6 +99,10 @@ poetry.lock
 # Cython debug symbols
 cython_debug/
 
+# Alembic
+# Don't ignore the versions directory - we want to track migrations
+# alembic/versions/*.pyc files are already covered by __pycache__/
+
 # VS Code
 .vscode/
 
