@@ -39,8 +39,6 @@ from progress_tracking import (
     clear_scan_progress,
 )
 from progress_tracking import get_redis_client
-from aws_api import aws_bp
-import random
 from models import db, AnalysisResult, IgnoredFinding
 from azure_devops.azure_devops_api import azure_devops_bp
 from v2_api import v2_api_bp
@@ -51,9 +49,18 @@ from sse_progress import sse_bp  # SSE for real-time progress streaming
 # from codecommit_api import codecommit_bp
 from codecommit.codecommit_api import codecommit_bp
 
-# Unified Cloud Scanner API
+# ============================================================================
+# UNIFIED CLOUD SCANNER API - New Architecture
+# ============================================================================
 from cloud_scanner.unified_api import UnifiedCloudAPI
-from cloud_scanner.providers.aws.aws_api import register_aws_provider
+from cloud_scanner import register_provider
+
+# Import AWS scanner components
+from aws_scanner import (
+    AwsSecurityScanner,
+    scan_aws_account_handler,
+    validate_aws_credentials
+)
 
 # Configure logging
 logging.basicConfig(
@@ -242,23 +249,13 @@ def check_and_add_columns():
         """
             )
         )
-        column_exists = bool(result.scalar())
-
-        if not column_exists:
+        if not result.scalar():
             logger.info("Adding user_id column...")
             db.session.execute(
                 text(
                     """
                 ALTER TABLE analysis_results 
-                ADD COLUMN IF NOT EXISTS user_id VARCHAR(255)
-            """
-                )
-            )
-            db.session.execute(
-                text(
-                    """
-                CREATE INDEX IF NOT EXISTS ix_analysis_results_user_id 
-                ON analysis_results (user_id)
+                ADD COLUMN user_id VARCHAR(255)
             """
                 )
             )
@@ -273,15 +270,13 @@ def check_and_add_columns():
         """
             )
         )
-        rerank_exists = bool(result.scalar())
-
-        if not rerank_exists:
+        if not result.scalar():
             logger.info("Adding rerank column...")
             db.session.execute(
                 text(
                     """
                 ALTER TABLE analysis_results 
-                ADD COLUMN IF NOT EXISTS rerank JSONB
+                ADD COLUMN rerank JSONB
             """
                 )
             )
@@ -290,1366 +285,371 @@ def check_and_add_columns():
     except Exception as e:
         logger.error(f"Error checking/adding columns: {str(e)}")
         db.session.rollback()
-        raise
-    finally:
-        db.session.remove()
 
 
-# Initialize Flask app and Redis
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.from_url(
-    REDIS_URL,
-    decode_responses=True,
-    socket_timeout=5,
-    socket_connect_timeout=5,
-    socket_keepalive=True,
-    health_check_interval=30,
-    retry_on_timeout=True,
-)
+def format_private_key(key_string):
+    """
+    Format the private key string properly for PyGithub
+    """
+    if not key_string:
+        raise ValueError("Private key is empty")
 
-# Initialize Redis pub/sub for WebSocket communication
-pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+    if not key_string.startswith("-----BEGIN"):
+        parts = key_string.split()
+        if len(parts) > 0:
+            formatted = "-----BEGIN RSA PRIVATE KEY-----\n"
+            for i in range(0, len(parts), 1):
+                formatted += parts[i] + "\n"
+            formatted += "-----END RSA PRIVATE KEY-----"
+            return formatted
 
-# Initialize Flask app
+    return key_string
+
+
+def verify_webhook_signature(payload_body, signature_header):
+    """Verify that webhook request came from GitHub"""
+    if not signature_header:
+        return False
+
+    hash_object = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"), msg=payload_body, digestmod=hashlib.sha256
+    )
+    expected_signature = "sha256=" + hash_object.hexdigest()
+    return hmac.compare_digest(expected_signature, signature_header)
+
+
+# Load environment variables
+load_dotenv()
+
+# Create Flask app
 app = Flask(__name__)
-# Configure CORS for all routes including blueprints
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "workspace-id", "organization-id", "accesstoken", "accessToken"],
-        "max_age": 3600
-    }
-}, supports_credentials=False)
 
-
-socketio = SocketIO(
-    cors_allowed_origins="*",
-    message_queue=REDIS_URL,
-    channel="semgrep-scan",
-    async_mode="gevent",
-    ping_timeout=60,
-    ping_interval=25,
-    max_http_buffer_size=5 * 1024 * 1024,
-    async_handlers=True,
-    logger=True,
-    engineio_logger=True,
-    manage_session=False,
-    cookie=None,
-)
-socketio.init_app(app)
-
-# Initialize cache
-cache = Cache(
-    config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 7200}  # 2 hours
-)
-cache.init_app(app)
-app.cache = cache
-
-register_aws_provider()
-# register_azure_provider()  
-# register_gcp_provider()    
-
-# unified cloud API at /api/v1/cloud/*
-unified_cloud_api = UnifiedCloudAPI()
-cloud_bp = unified_cloud_api.get_blueprint()
-app.register_blueprint(cloud_bp, url_prefix='/api/v1/cloud')
-
-# Register blueprints
-app.register_blueprint(progress_bp)
-app.register_blueprint(api, name="api_main")
-app.register_blueprint(analysis_bp, name="analysis_main")
-app.register_blueprint(aws_bp, name="aws_main")  # Keep for backward compatibility
-app.register_blueprint(azure_devops_bp, name="azure_devops")
-app.register_blueprint(v2_api_bp, name="v2_api")
-app.register_blueprint(gitlab_bp, name="gitlab_main")
-app.register_blueprint(zap_bp, name="zap_main")
-app.register_blueprint(sse_bp, name="sse_main")  # SSE for progress streaming
-# app.register_blueprint(codecommit_bp, name="codecommit_main")
-app.register_blueprint(codecommit_bp, name="codecommit_main_2")
-
-
-def redis_listener():
-    """
-    Enhanced Redis listener with immediate cleanup of completed scan data.
-    """
-    last_processed = {}
-    min_interval = 0.1
-    reconnect_delay = 5
-    max_reconnect_delay = 30
-    connection_attempt = 0
-
-    listener_redis = None
-    pubsub = None
-
-    CRITICAL_STAGES = {
-        "initializing",
-        "error",
-        "completed",
-        "validation_complete",
-        "scan_complete",
-        "reset",
-    }
-
-    while True:
-        try:
-            # Initialize or reinitialize Redis connection if needed
-            if (
-                listener_redis is None
-                or pubsub is None
-                or not hasattr(pubsub, "connection")
-                or pubsub.connection is None
-            ):
-                connection_attempt += 1
-                try:
-                    logger.info("Initializing Redis pub/sub connection")
-                    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-                    listener_redis = redis.from_url(
-                        REDIS_URL,
-                        decode_responses=True,
-                        socket_timeout=10,
-                        socket_connect_timeout=5,
-                        socket_keepalive=True,
-                        health_check_interval=30,
-                        retry_on_timeout=True,
-                    )
-
-                    pubsub = listener_redis.pubsub(ignore_subscribe_messages=True)
-                    pubsub.subscribe("scan_updates")
-
-                    logger.info("Successfully subscribed to scan_updates channel")
-
-                    connection_attempt = 0
-                    reconnect_delay = 5
-
-                    # Purge any old messages
-                    while pubsub.get_message(timeout=0.1):
-                        pass
-
-                except Exception as e:
-                    logger.error(f"Failed to initialize Redis connection: {str(e)}")
-                    current_delay = min(
-                        max_reconnect_delay,
-                        reconnect_delay * (1.5 ** min(connection_attempt - 1, 5)),
-                    )
-                    logger.info(
-                        f"Retrying in {current_delay:.1f} seconds (attempt {connection_attempt})"
-                    )
-                    time.sleep(current_delay)
-                    continue
-
-            try:
-                message = pubsub.get_message(timeout=1.0)
-            except redis.TimeoutError:
-                time.sleep(0.1)
-                continue
-            except (redis.ConnectionError, ConnectionError) as e:
-                logger.error(f"Redis connection error: {str(e)}")
-                pubsub = None
-                listener_redis = None
-                time.sleep(reconnect_delay)
-                continue
-
-            if not message:
-                if random.random() < 0.01:
-                    try:
-                        if listener_redis is not None:
-                            listener_redis.ping()
-                    except Exception as e:
-                        logger.error(f"Redis health check failed: {str(e)}")
-                        pubsub = None
-                        listener_redis = None
-                        time.sleep(1)
-                time.sleep(0.01)
-                continue
-
-            if message and message["type"] == "message":
-                try:
-                    data = json.loads(message["data"])
-
-                    scan_type = data.get("scan_type", "repository")
-                    user_id = data.get("user_id")
-                    resource_id = data.get("repo_name")
-                    room = data.get("room")
-                    progress_data = data.get("data", {})
-
-                    is_completion = data.get("is_completion", False)
-                    is_error = data.get("is_error", False)
-
-                    # ENHANCED COMPLETION HANDLING WITH IMMEDIATE CLEANUP
-                    if is_completion or is_error:
-                        logger.info(
-                            f"Processing {'completion' if is_completion else 'error'} message for {room}"
-                        )
-
-                        from progress_tracking import get_room_members
-
-                        members = get_room_members(room)
-
-                        # Broadcast to room
-                        socketio.emit("progress_update", progress_data, room=room)
-                        socketio.emit(
-                            "scan_complete",
-                            {
-                                "status": "completed" if is_completion else "error",
-                                "timestamp": int(time.time()),
-                            },
-                            room=room,
-                        )
-
-                        # Send directly to each client
-                        for member in members:
-                            try:
-                                socketio.emit(
-                                    "progress_update", progress_data, to=member
-                                )
-                                socketio.emit(
-                                    "scan_complete",
-                                    {
-                                        "status": (
-                                            "completed" if is_completion else "error"
-                                        ),
-                                        "direct": True,
-                                        "timestamp": int(time.time()),
-                                    },
-                                    to=member,
-                                )
-                                logger.info(f"Sent direct completion to {member}")
-                            except Exception as direct_err:
-                                logger.error(
-                                    f"Error sending direct message: {str(direct_err)}"
-                                )
-
-                            time.sleep(0.05)
-
-                        # IMMEDIATE CLEANUP OF COMPLETED DATA
-                        try:
-                            cleanup_keys = [
-                                f"scan_progress:{user_id}:{resource_id}",
-                                f"scan_complete:{user_id}:{resource_id}",
-                                f"current_scan:{user_id}:{resource_id}",
-                            ]
-
-                            for key in cleanup_keys:
-                                listener_redis.delete(key)
-
-                            logger.info(
-                                f"Immediately cleaned up completion data for {user_id}:{resource_id}"
-                            )
-
-                        except Exception as cleanup_err:
-                            logger.error(
-                                f"Error in immediate cleanup: {str(cleanup_err)}"
-                            )
-
-                        logger.info(
-                            f"Processed completion event for {len(members)} clients"
-                        )
-                    else:
-                        # Regular progress update
-                        socketio.emit("progress_update", progress_data, room=room)
-
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
-
-            time.sleep(0.01)
-
-        except Exception as e:
-            logger.error(f"Redis listener error: {str(e)}")
-            time.sleep(1)
-
-
-def cleanup_room_after_delay(room, delay_seconds):
-    """Clean up a room after a delay with improved approach."""
-    socketio.sleep(delay_seconds)
-    try:
-        # When sending the completion message, use a special identifier
-        completion_data = {
-            "status": "completed",
-            "timestamp": int(time.time()),
-            "message_type": "final_completion",  # Add this identifier
+# Configure CORS to allow all origins
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "*",
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": [
+                "Content-Type",
+                "Authorization",
+                "X-Requested-With",
+                "workspace-id",
+                "organization-id",
+                "accesstoken",
+                "accessToken",
+            ],
+            "supports_credentials": False,
+            "expose_headers": ["Content-Type", "Authorization"],
         }
+    },
+)
 
-        # Send as a PROGRESS_UPDATE instead of a separate event type
-        socketio.emit(
-            "progress_update",
-            {
-                "s": "final_complete",
-                "p": 100,
-                "o": 100,
-                "t": int(time.time()),
-                "final": True,  # Add this flag
-            },
-            room=room,
-        )
+# Configure Redis
+redis_client = get_redis_client()
 
-        # Now also send the original event
-        socketio.emit("scan_complete", completion_data, room=room)
+# Configure Cache
+CACHE_TYPE = os.getenv("CACHE_TYPE", "SimpleCache")
+if CACHE_TYPE == "RedisCache":
+    cache = Cache(
+        app, config={"CACHE_TYPE": "RedisCache", "CACHE_REDIS_URL": redis_client.url}
+    )
+else:
+    cache = Cache(app, config={"CACHE_TYPE": "SimpleCache"})
 
-    except Exception as e:
-        logger.error(f"Error during room cleanup: {str(e)}")
+# Configure SocketIO with Redis for multi-instance support
+redis_host = os.getenv("REDIS_HOST", "localhost")
+redis_port = int(os.getenv("REDIS_PORT", 6379))
+redis_password = os.getenv("REDIS_PASSWORD", None)
+
+socketio_config = {
+    "cors_allowed_origins": "*",
+    "async_mode": "gevent",
+    "ping_timeout": 60,
+    "ping_interval": 25,
+}
+
+if CACHE_TYPE == "RedisCache":
+    socketio_config["message_queue"] = (
+        f"redis://:{redis_password}@{redis_host}:{redis_port}/0"
+        if redis_password
+        else f"redis://{redis_host}:{redis_port}/0"
+    )
+
+socketio = SocketIO(app, **socketio_config)
+
+logger.info("SocketIO initialized successfully")
 
 
-@socketio.on_error_default
-def error_handler(e):
-    """Global error handler with improved logging"""
-    logger.error(f"SocketIO error: {str(e)}", exc_info=True)
-
-    # Get the client's socket ID
-    try:
-        sid = request.sid
-        logger.error(f"Error occurred for client {sid}")
-    except:
-        pass
-
-
+# SocketIO Event Handlers
 @socketio.on("connect")
 def handle_connect():
-    """Handle client connection with reliable session tracking"""
-    try:
-        sid = request.sid
-        # Create a more secure session tracking mechanism
-        manage_session(sid, "add")
-        cleanup_old_sessions()
-
-        # Log the connection with more detail
-        user_agent = request.headers.get("User-Agent", "Unknown")
-        transport = getattr(request, "transport", "Unknown")
-        logger.info(
-            f"Client connected: {sid} | Transport: {transport} | UA: {user_agent[:50]}"
-        )
-
-        # Record connection timestamp in Redis
-        redis_client = get_redis_client()
-        redis_client.hset(f"socket:{sid}", "connected_at", int(time.time()))
-        redis_client.expire(f"socket:{sid}", 3600)  # 1 hour expiration
-
-        # Send connection acknowledgment with server timestamp for latency calculation
-        emit(
-            "connected",
-            {
-                "status": "connected",
-                "sid": sid,
-                "server_time": int(time.time() * 1000),  # milliseconds
-            },
-        )
-    except Exception as e:
-        logger.error(f"Connection error: {str(e)}", exc_info=True)
-        return False
+    """Handle client connection"""
+    logger.info(f"Client connected: {request.sid}")
+    manage_session(request.sid, "add")
+    emit("connected", {"data": "Connected to progress server"})
 
 
 @socketio.on("disconnect")
-def handle_disconnect(arg=None):
-    """Handle client disconnection with proper cleanup"""
+def handle_disconnect():
+    """Handle client disconnection"""
+    logger.info(f"Client disconnected: {request.sid}")
+    manage_session(request.sid, "remove")
+
+
+@socketio.on("subscribe_progress")
+def handle_subscribe_progress(data):
+    """Handle subscription to progress updates"""
     try:
-        sid = request.sid
-        if sid:
-            # Remove from session management
-            manage_session(sid, "remove")
-
-            # Get the client's subscriptions before removing them
-            redis_client = get_redis_client()
-            subscription_key = f"socket_subscription:{sid}"
-            subscription_data = redis_client.hgetall(subscription_key)
-
-            if subscription_data:
-                room = subscription_data.get("room")
-                logger.info(f"Client {sid} disconnected from room {room}")
-
-                # Clean up subscription data
-                from progress_tracking import unregister_socket_subscription
-
-                unregister_socket_subscription(sid)
-            else:
-                logger.info(f"Client {sid} disconnected (no subscriptions)")
-
-            # Remove connection record
-            redis_client.delete(f"socket:{sid}")
-    except Exception as e:
-        logger.error(f"Disconnection error: {str(e)}", exc_info=True)
-
-
-@socketio.on("ping_server")
-def handle_ping(data=None):
-    """Enhanced ping handler with latency tracking"""
-    try:
-        sid = request.sid
-        client_time = data.get("time", 0) if isinstance(data, dict) else 0
-        now = int(time.time() * 1000)  # milliseconds
-
-        # Calculate latency if client provided a timestamp
-        latency = None
-        if client_time > 0:
-            latency = now - client_time
-
-        response = {"server_time": now, "sid": sid}
-
-        if latency is not None:
-            response["latency"] = latency
-
-            # Log high latency values
-            if latency > 500:  # 500ms threshold
-                logger.warning(f"High latency ({latency}ms) detected for client {sid}")
-
-        emit("pong_server", response)
-    except Exception as e:
-        logger.error(f"Ping/pong error: {str(e)}")
-
-
-@socketio.on("subscribe_to_scan")
-def handle_subscribe(data):
-    """
-    Enhanced repository scan subscription handler that avoids showing completed states.
-    """
-    try:
-        sid = request.sid
-        logger.info(f"Repository scan subscription request from {sid}: {data}")
-
-        # Validate session
-        if not manage_session(sid, "check"):
-            logger.warning(f"Invalid session attempting to subscribe: {sid}")
-            emit("error", {"message": "Invalid session"})
-            return
-
-        # Validate subscription data
         user_id = data.get("user_id")
         repo_name = data.get("repo_name")
 
-        if not all([user_id, repo_name]):
-            logger.warning(f"Invalid repository subscription request: {data}")
-            emit("error", {"message": "Invalid subscription parameters"})
+        if not user_id or not repo_name:
+            emit("error", {"message": "Missing user_id or repo_name"})
             return
 
-        # AGGRESSIVE CLEANUP BEFORE SUBSCRIPTION
-        from progress_tracking import aggressively_clear_scan_data
-
-        aggressively_clear_scan_data(user_id, repo_name, "repository")
-
-        # Create room name
-        room = f"scan_{user_id}_{repo_name}"
-
-        # Join the room
+        room = f"{user_id}:{repo_name}"
         join_room(room)
-        logger.info(f"Client {sid} subscribed to repository scan room: {room}")
 
-        # Register subscription in Redis
-        from progress_tracking import register_socket_subscription
+        logger.info(f"Client {request.sid} subscribed to progress for {room}")
 
-        register_socket_subscription(
-            socket_id=sid,
-            user_id=user_id,
-            resource_id=repo_name,
-            scan_type="repository",
-        )
-
-        # Send confirmation to client
-        emit(
-            "room_joined",
-            {"room": room, "status": "subscribed", "timestamp": int(time.time())},
-        )
-
-        # Check for ACTIVE scan (avoiding completed states)
-        from progress_tracking import get_scan_progress
-
-        progress = get_scan_progress(user_id, repo_name)
-
-        if progress:
-            # There's an active, ongoing scan
-            scan_id = progress.get("scan_id")
-            stage = progress.get("stage", "unknown")
-            stage_progress = progress.get("stage_progress", 0)
-            overall_progress = progress.get("overall_progress", 0)
-            timestamp = progress.get("unix_timestamp", int(time.time()))
-
-            ws_data = {
-                "s": stage,
-                "p": stage_progress,
-                "o": overall_progress,
-                "t": timestamp,
-                "id": scan_id,
-            }
-
-            emit("progress_update", ws_data)
-            logger.info(
-                f"Sent active scan progress to {sid}: {stage} at {overall_progress}%"
-            )
+        progress_data = get_scan_progress(user_id, repo_name)
+        if progress_data and progress_data.get("stage") != "completed":
+            emit("progress_update", progress_data)
         else:
-            # No active scan - send waiting state
             emit(
-                "scan_waiting",
-                {"message": "Ready for scan to start", "timestamp": int(time.time())},
-            )
-            logger.info(f"No active scan for {repo_name}, client ready for new scan")
-
-    except Exception as e:
-        logger.error(f"Repository scan subscription error: {str(e)}", exc_info=True)
-        emit("error", {"message": "Subscription failed, please try again"})
-
-
-@socketio.on("subscribe_to_aws_scan")
-def handle_aws_subscribe(data):
-    """
-    Enhanced AWS scan subscription handler that avoids showing completed states.
-    """
-    try:
-        sid = request.sid
-        user_id = data.get("user_id")
-        account_id = data.get("account_id")
-
-        if not all([user_id, account_id]):
-            emit("error", {"message": "Invalid parameters"})
-            return
-
-        # AGGRESSIVE CLEANUP BEFORE SUBSCRIPTION
-        from progress_tracking import aggressively_clear_scan_data
-
-        aggressively_clear_scan_data(user_id, account_id, "aws")
-
-        # Join the room
-        room = f"aws_scan_{user_id}_{account_id}"
-        join_room(room)
-        logger.info(f"Client {sid} joined AWS scan room {room}")
-
-        # Register subscription in Redis
-        from progress_tracking import register_socket_subscription
-
-        register_socket_subscription(
-            socket_id=sid, user_id=user_id, resource_id=account_id, scan_type="aws"
-        )
-
-        # Send confirmation
-        emit(
-            "room_joined",
-            {"room": room, "status": "subscribed", "timestamp": int(time.time())},
-        )
-
-        # Check for ACTIVE scan (avoiding completed states)
-        from progress_tracking import get_scan_progress
-
-        progress = get_scan_progress(user_id, account_id)
-
-        if progress:
-            # There's an active, ongoing scan
-            try:
-                emit(
-                    "progress_update",
-                    {
-                        "s": progress.get("stage", "unknown"),
-                        "p": progress.get("stage_progress", 0),
-                        "o": progress.get("overall_progress", 0),
-                        "t": progress.get("unix_timestamp", int(time.time())),
-                        "id": progress.get("scan_id", "unknown"),
-                    },
-                )
-                logger.info(
-                    f"Sent current AWS progress to {sid}: {progress.get('stage')} ({progress.get('overall_progress')}%)"
-                )
-            except Exception as e:
-                logger.error(f"Error sending AWS progress: {str(e)}")
-        else:
-            # No active scan - send waiting state
-            emit(
-                "scan_waiting",
+                "progress_update",
                 {
-                    "message": "Ready for AWS scan to start",
-                    "timestamp": int(time.time()),
+                    "stage": "not_started",
+                    "progress": 0,
+                    "message": "No active scan",
                 },
             )
-            logger.info(
-                f"No active AWS scan for {account_id}, client ready for new scan"
-            )
 
     except Exception as e:
-        logger.error(f"AWS subscription error: {str(e)}")
-        emit("error", {"message": "AWS subscription failed"})
+        logger.error(f"Error in subscribe_progress: {str(e)}")
+        emit("error", {"message": "Failed to subscribe to progress updates"})
 
 
-@socketio.on("subscribe_to_gitlab_scan")
-def handle_gitlab_subscribe(data):
-    """
-    Enhanced GitLab scan subscription handler that avoids showing completed states.
-    """
+# Register existing blueprints
+app.register_blueprint(api, url_prefix="/api/v1")
+app.register_blueprint(progress_bp, url_prefix="/progress")
+app.register_blueprint(analysis_bp, url_prefix="/api/v1")
+app.register_blueprint(azure_devops_bp, url_prefix="/api/v1/azure-devops")
+app.register_blueprint(v2_api_bp, url_prefix="/api/v2")
+app.register_blueprint(gitlab_bp, url_prefix="/api/v1")
+app.register_blueprint(codecommit_bp, url_prefix="/api/v1")
+app.register_blueprint(zap_bp, url_prefix="/api/v1")
+app.register_blueprint(sse_bp, url_prefix="/api/v1")
+
+# ============================================================================
+# REGISTER CLOUD PROVIDERS
+# ============================================================================
+
+def register_cloud_providers():
+    """Register all cloud provider integrations with the unified API"""
+    
+    logger.info("Registering cloud providers...")
+    
+    # Register AWS
     try:
-        sid = request.sid
-        user_id = data.get("user_id")
-        project_id = data.get("project_id")
-
-        if not all([user_id, project_id]):
-            emit("error", {"message": "Invalid parameters"})
-            return
-
-        # AGGRESSIVE CLEANUP BEFORE SUBSCRIPTION
-        from progress_tracking import aggressively_clear_scan_data
-
-        aggressively_clear_scan_data(user_id, project_id, "gitlab")
-
-        # Join the room
-        room = f"gitlab_scan_{user_id}_{project_id}"
-        join_room(room)
-        logger.info(f"Client {sid} joined GitLab scan room {room}")
-
-        # Register subscription in Redis
-        from progress_tracking import register_socket_subscription
-
-        register_socket_subscription(
-            socket_id=sid, user_id=user_id, resource_id=project_id, scan_type="gitlab"
+        register_provider(
+            provider_name='aws',
+            scan_handler=scan_aws_account_handler,
+            validator=validate_aws_credentials,
+            scanner_class=AwsSecurityScanner
         )
-
-        # Send confirmation
-        emit(
-            "room_joined",
-            {"room": room, "status": "subscribed", "timestamp": int(time.time())},
-        )
-
-        # Check for ACTIVE scan (avoiding completed states)
-        from progress_tracking import get_scan_progress
-
-        progress = get_scan_progress(user_id, project_id)
-
-        if progress:
-            # There's an active, ongoing scan
-            try:
-                emit(
-                    "progress_update",
-                    {
-                        "s": progress.get("stage", "unknown"),
-                        "p": progress.get("stage_progress", 0),
-                        "o": progress.get("overall_progress", 0),
-                        "t": progress.get("unix_timestamp", int(time.time())),
-                        "id": progress.get("scan_id", "unknown"),
-                    },
-                )
-                logger.info(
-                    f"Sent current GitLab progress to {sid}: {progress.get('stage')} ({progress.get('overall_progress')}%)"
-                )
-            except Exception as e:
-                logger.error(f"Error sending GitLab progress: {str(e)}")
-        else:
-            # No active scan - send waiting state
-            emit(
-                "scan_waiting",
-                {
-                    "message": "Ready for GitLab scan to start",
-                    "timestamp": int(time.time()),
-                },
-            )
-            logger.info(
-                f"No active GitLab scan for {project_id}, client ready for new scan"
-            )
-
+        logger.info("✓ AWS provider registered successfully")
     except Exception as e:
-        logger.error(f"GitLab subscription error: {str(e)}")
-        emit("error", {"message": "GitLab subscription failed"})
+        logger.error(f"✗ Failed to register AWS provider: {str(e)}")
+    
+    # TODO: Register Azure when ready
+    # try:
+    #     from azure_scanner import (
+    #         AzureSecurityScanner,
+    #         scan_azure_subscription_handler,
+    #         validate_azure_credentials
+    #     )
+    #     register_provider(
+    #         provider_name='azure',
+    #         scan_handler=scan_azure_subscription_handler,
+    #         validator=validate_azure_credentials,
+    #         scanner_class=AzureSecurityScanner
+    #     )
+    #     logger.info("✓ Azure provider registered successfully")
+    # except Exception as e:
+    #     logger.error(f"✗ Failed to register Azure provider: {str(e)}")
+    
+    # TODO: Register GCP when ready
+    # try:
+    #     from gcp_scanner import (
+    #         GcpSecurityScanner,
+    #         scan_gcp_project_handler,
+    #         validate_gcp_credentials
+    #     )
+    #     register_provider(
+    #         provider_name='gcp',
+    #         scan_handler=scan_gcp_project_handler,
+    #         validator=validate_gcp_credentials,
+    #         scanner_class=GcpSecurityScanner
+    #     )
+    #     logger.info("✓ GCP provider registered successfully")
+    # except Exception as e:
+    #     logger.error(f"✗ Failed to register GCP provider: {str(e)}")
 
 
-@socketio.on("subscribe_to_zap_scan")
-def handle_zap_subscribe(data):
-    """
-    ZAP scan subscription handler
-    """
-    try:
-        sid = request.sid
-        user_id = data.get("user_id")
-        target_url = data.get("target_url")
+# Register cloud providers
+register_cloud_providers()
 
-        if not all([user_id, target_url]):
-            emit("error", {"message": "Invalid parameters"})
-            return
+# ============================================================================
+# REGISTER UNIFIED CLOUD API
+# ============================================================================
 
-        from zap_scan_tracker import get_zap_scan_progress
+# Create unified cloud API instance
+unified_cloud_api = UnifiedCloudAPI()
 
-        from zap_scan_tracker import zap_tracker
+# Register the unified API at /api/v1/cloud
+app.register_blueprint(unified_cloud_api.get_blueprint(), url_prefix='/api/v1/cloud')
 
-        resource_id = zap_tracker._sanitize_target_id(target_url)
-        room = f"zap_scan_{user_id}_{resource_id}"
+logger.info("✓ Unified Cloud API registered at /api/v1/cloud")
 
-        join_room(room)
-        logger.info(f"Client {sid} joined ZAP scan room {room}")
+# ============================================================================
+# OPTIONAL: Keep old AWS API for backward compatibility (temporary)
+# Uncomment the following lines if you need backward compatibility
+# ============================================================================
 
-        from progress_tracking import register_socket_subscription
-
-        register_socket_subscription(
-            socket_id=sid, user_id=user_id, resource_id=resource_id, scan_type="zap"
-        )
-
-        # Send confirmation
-        emit(
-            "room_joined",
-            {
-                "room": room,
-                "status": "subscribed",
-                "scan_type": "zap",
-                "timestamp": int(time.time()),
-            },
-        )
-
-        progress = get_zap_scan_progress(user_id, target_url)
-
-        if progress:
-            try:
-                emit(
-                    "progress_update",
-                    {
-                        "s": progress.get(
-                            "display_stage", progress.get("stage", "unknown")
-                        ),
-                        "p": progress.get("stage_progress", 0),
-                        "o": progress.get("overall_progress", 0),
-                        "t": progress.get("unix_timestamp", int(time.time())),
-                        "id": progress.get("scan_id", "unknown"),
-                        "scan_type": "zap",
-                        "target_url": progress.get("target_url", target_url),
-                    },
-                )
-                logger.info(
-                    f"Sent current ZAP progress to {sid}: {progress.get('stage')} ({progress.get('overall_progress')}%)"
-                )
-            except Exception as e:
-                logger.error(f"Error sending ZAP progress: {str(e)}")
-        else:
-            emit(
-                "scan_waiting",
-                {
-                    "message": "Ready for ZAP scan to start",
-                    "scan_type": "zap",
-                    "timestamp": int(time.time()),
-                },
-            )
-            logger.info(
-                f"No active ZAP scan for {target_url}, client ready for new scan"
-            )
-
-    except Exception as e:
-        logger.error(f"ZAP subscription error: {str(e)}")
-        emit("error", {"message": "ZAP subscription failed"})
+# from aws_api import aws_bp
+# app.register_blueprint(aws_bp, url_prefix='/api/v1/aws')
+# logger.warning("⚠ Legacy AWS API active at /api/v1/aws (backward compatibility mode)")
 
 
-def initiate_new_scan(
-    user_id: str, resource_id: str, scan_type: str = "repository"
-) -> str:
-    """
-    Helper function to properly initiate a new scan with cleanup and unique ID generation.
-
-    Args:
-        user_id: User ID
-        resource_id: Resource ID (repo name, account ID, etc.)
-        scan_type: Type of scan ('repository', 'aws', 'gitlab')
-
-    Returns:
-        str: New scan ID
-    """
-    try:
-        from progress_tracking import start_new_scan, update_scan_progress
-        import uuid
-
-        # Start new scan with cleanup and unique ID
-        scan_id = start_new_scan(user_id, resource_id, scan_type)
-
-        # Send initial progress update
-        update_scan_progress(
-            user_id=user_id,
-            repo_name=resource_id,
-            stage="initializing",
-            progress=0,
-            scan_type=scan_type,
-            scan_id=scan_id,
-        )
-
-        logger.info(
-            f"Initiated new {scan_type} scan {scan_id} for {user_id}:{resource_id}"
-        )
-        return scan_id
-
-    except Exception as e:
-        logger.error(f"Error initiating new scan: {str(e)}")
-        # Return a fallback unique ID
-        import uuid
-
-        return f"scan_{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-
-
-# Start Redis listener in background
-redis_listener_thread = Thread(target=redis_listener, daemon=True)
-redis_listener_thread.start()
-
-
-@app.route("/health")
+# Health check endpoint
+@app.route("/health", methods=["GET"])
 def health_check():
+    """Enhanced health check with database status"""
     try:
-        # Test database connection
+        # Check database connection
         with app.app_context():
             db.session.execute(text("SELECT 1"))
-            db.session.commit()
+            db_status = "healthy"
+    except Exception as e:
+        logger.error(f"Health check DB error: {str(e)}")
+        db_status = "unhealthy"
 
-        # Test Redis connection
+    # Check Redis connection
+    try:
         redis_client.ping()
+        redis_status = "healthy"
+    except Exception as e:
+        logger.error(f"Health check Redis error: {str(e)}")
+        redis_status = "unhealthy"
 
-        return jsonify(
-            {
-                "status": "healthy",
-                "timestamp": datetime.utcnow().isoformat(),
-                "database": "connected",
-                "redis": "connected",
-                "database_url": DATABASE_URL is not None,
-                "redis_url": REDIS_URL is not None,
-                "git_integration": (
-                    "initialized"
-                    if "git_integration" in globals()
-                    else "not initialized"
-                ),
+    # Get registered cloud providers
+    from cloud_scanner.provider_registry import CloudProviderRegistry
+    registry = CloudProviderRegistry()
+    registered_providers = registry.list_providers()
+
+    overall_status = "healthy" if db_status == "healthy" and redis_status == "healthy" else "degraded"
+
+    return jsonify(
+        {
+            "status": overall_status,
+            "timestamp": datetime.now().isoformat(),
+            "services": {
+                "database": db_status,
+                "redis": redis_status,
+                "socketio": "healthy",
+            },
+            "cloud_providers": {
+                "available": registered_providers,
+                "count": len(registered_providers)
+            },
+            "apis": {
+                "unified_cloud_api": "/api/v1/cloud",
+                "repository_scanner": "/api/v1",
+                "azure_devops": "/api/v1/azure-devops",
+                "gitlab": "/api/v1",
+                "codecommit": "/api/v1",
+                "zap": "/api/v1",
             }
-        )
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return (
-            jsonify(
-                {
-                    "status": "unhealthy",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "error": str(e),
-                }
-            ),
-            500,
-        )
+        }
+    ), (200 if overall_status == "healthy" else 503)
 
 
-@app.route("/api/v1/debug/schema", methods=["GET"])
-def debug_schema():
+# GitHub webhook endpoint
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Handle incoming webhook from GitHub"""
     try:
-        result = db.session.execute(
-            text(
-                """
-            SELECT column_name, data_type 
-            FROM information_schema.columns 
-            WHERE table_name='cloud_scans'
-            ORDER BY ordinal_position;
-        """
-            )
-        )
+        signature = request.headers.get("X-Hub-Signature-256")
+        if not verify_webhook_signature(request.data, signature):
+            logger.warning("Invalid webhook signature")
+            return jsonify({"error": "Invalid signature"}), 401
 
-        columns = [{"name": row.column_name, "type": row.data_type} for row in result]
+        payload = request.json
+        event_type = request.headers.get("X-GitHub-Event")
 
-        return jsonify({"table": "cloud_scans", "columns": columns})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.info(f"Received webhook event: {event_type}")
 
+        if event_type == "installation":
+            action = payload.get("action")
+            installation_id = payload.get("installation", {}).get("id")
+            logger.info(f"Installation {action}: {installation_id}")
 
-@app.route("/api/v1/debug/add-columns", methods=["POST"])
-def add_columns_endpoint():
-    try:
-        with app.app_context():
-            # Check if completed_at column exists
-            result = db.session.execute(
-                text(
-                    """
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='cloud_scans' AND column_name='completed_at'
-            """
-                )
-            )
-            completed_at_exists = bool(result.scalar())
+        elif event_type == "push":
+            repository = payload.get("repository", {})
+            repo_name = repository.get("full_name")
+            installation_id = payload.get("installation", {}).get("id")
 
-            # Check if error column exists
-            result = db.session.execute(
-                text(
-                    """
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='cloud_scans' AND column_name='error'
-            """
-                )
-            )
-            error_exists = bool(result.scalar())
+            logger.info(f"Push event for repository: {repo_name}")
 
-            # Add columns if they don't exist
-            changes_made = False
+            if installation_id:
+                try:
+                    token = git_integration.get_access_token(installation_id).token
+                    g = Github(token)
+                    repo = g.get_repo(repo_name)
 
-            if not completed_at_exists:
-                db.session.execute(
-                    text(
-                        """
-                    ALTER TABLE cloud_scans 
-                    ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP
-                """
+                    config = ScanConfig(
+                        repository_url=repository.get("clone_url"),
+                        branch=payload.get("ref", "main").split("/")[-1],
+                        repository_name=repo_name,
                     )
-                )
-                db.session.commit()
-                changes_made = True
 
-            if not error_exists:
-                db.session.execute(
-                    text(
-                        """
-                    ALTER TABLE cloud_scans 
-                    ADD COLUMN IF NOT EXISTS error TEXT
-                """
-                    )
-                )
-                db.session.commit()
-                changes_made = True
+                    logger.info(f"Starting security scan for {repo_name}")
 
-            # Check schema after changes
-            result = db.session.execute(
-                text(
-                    """
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='cloud_scans'
-                ORDER BY ordinal_position
-            """
-                )
-            )
+                    def run_scan():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        result = loop.run_until_complete(
+                            scan_repository_handler(config, None)
+                        )
+                        loop.close()
+                        return result
 
-            columns = [row.column_name for row in result]
+                    scan_thread = Thread(target=run_scan)
+                    scan_thread.start()
 
-            return jsonify(
-                {
-                    "success": True,
-                    "changes_made": changes_made,
-                    "before": {
-                        "completed_at_exists": completed_at_exists,
-                        "error_exists": error_exists,
-                    },
-                    "after": {
-                        "completed_at_exists": "completed_at" in columns,
-                        "error_exists": "error" in columns,
-                    },
-                    "columns": columns,
-                }
-            )
-    except Exception as e:
-        return (
-            jsonify(
-                {"success": False, "error": str(e), "traceback": traceback.format_exc()}
-            ),
-            500,
-        )
+                except Exception as e:
+                    logger.error(f"Error processing push event: {str(e)}")
+                    logger.error(traceback.format_exc())
 
-
-@app.route("/emergency/rds-info")
-def emergency_rds_info():
-    """Check RDS connection limits"""
-    try:
-        with db.engine.connect() as conn:
-            result = conn.execute(
-                text(
-                    """
-                SELECT 
-                    setting as max_connections
-                FROM pg_settings 
-                WHERE name = 'max_connections'
-            """
-                )
-            )
-            max_conn = result.scalar()
-
-            result = conn.execute(
-                text(
-                    """
-                SELECT 
-                    count(*) as total_connections,
-                    count(*) FILTER (WHERE state = 'active') as active,
-                    count(*) FILTER (WHERE state = 'idle') as idle,
-                    count(*) FILTER (WHERE state = 'idle in transaction') as idle_in_transaction
-                FROM pg_stat_activity 
-            """
-                )
-            )
-
-            row = result.fetchone()
-
-            return jsonify(
-                {
-                    "max_connections": int(max_conn),
-                    "current_total": row[0],
-                    "active": row[1],
-                    "idle": row[2],
-                    "idle_in_transaction": row[3],
-                    "percentage_used": round((row[0] / int(max_conn)) * 100, 2),
-                    "recommendation": (
-                        "INCREASE max_connections"
-                        if int(max_conn) < 100
-                        else "Connection management issue"
-                    ),
-                }
-            )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/emergency/db-status")
-def emergency_db_status():
-    """Emergency endpoint to check database status"""
-    try:
-        with db.engine.connect() as conn:
-            # Check current connections
-            result = conn.execute(
-                text(
-                    """
-                SELECT 
-                    count(*) as total_connections,
-                    count(*) FILTER (WHERE state = 'active') as active_connections,
-                    count(*) FILTER (WHERE state = 'idle') as idle_connections
-                FROM pg_stat_activity 
-                WHERE datname = current_database()
-            """
-                )
-            )
-
-            row = result.fetchone()
-
-            # Check max connections
-            max_conn_result = conn.execute(text("SHOW max_connections"))
-            max_connections = max_conn_result.scalar()
-
-            return jsonify(
-                {
-                    "status": "connected",
-                    "total_connections": row[0] if row else 0,
-                    "active_connections": row[1] if row else 0,
-                    "idle_connections": row[2] if row else 0,
-                    "max_connections": max_connections,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
-    except Exception as e:
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            ),
-            500,
-        )
-
-
-@app.route("/emergency/kill-idle-connections", methods=["POST"])
-def emergency_kill_idle_connections():
-    """Emergency endpoint to kill idle connections"""
-    try:
-        with db.engine.connect() as conn:
-            # Kill idle connections older than 5 minutes
-            result = conn.execute(
-                text(
-                    """
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity 
-                WHERE datname = current_database()
-                AND state = 'idle'
-                AND state_change < now() - interval '5 minutes'
-                AND pid != pg_backend_pid()
-            """
-                )
-            )
-
-            killed_count = len(result.fetchall())
-
-            return jsonify(
-                {
-                    "status": "success",
-                    "killed_connections": killed_count,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
-    except Exception as e:
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            ),
-            500,
-        )
-
-
-def format_private_key(key_data):
-    """Format the private key correctly for GitHub integration"""
-    try:
-        if not key_data:
-            raise ValueError("Private key is empty")
-
-        key_data = key_data.strip()
-
-        if "\\n" in key_data:
-            parts = key_data.split("\\n")
-            key_data = "\n".join(part.strip() for part in parts if part.strip())
-        elif "\n" not in key_data:
-            key_length = len(key_data)
-            if key_length < 64:
-                raise ValueError("Key content too short")
-
-            if not key_data.startswith("-----BEGIN"):
-                key_data = (
-                    "-----BEGIN RSA PRIVATE KEY-----\n"
-                    + "\n".join(
-                        key_data[i : i + 64] for i in range(0, len(key_data), 64)
-                    )
-                    + "\n-----END RSA PRIVATE KEY-----"
-                )
-
-        if not key_data.startswith("-----BEGIN RSA PRIVATE KEY-----"):
-            key_data = "-----BEGIN RSA PRIVATE KEY-----\n" + key_data
-        if not key_data.endswith("-----END RSA PRIVATE KEY-----"):
-            key_data = key_data + "\n-----END RSA PRIVATE KEY-----"
-
-        lines = key_data.split("\n")
-        if len(lines) < 3:
-            raise ValueError("Invalid key format - too few lines")
-
-        logger.info("Private key formatted successfully")
-        return key_data
+        return jsonify({"status": "success"}), 200
 
     except Exception as e:
-        logger.error(f"Error formatting private key: {str(e)}")
-        raise ValueError(f"Private key formatting failed: {str(e)}")
-
-
-def verify_webhook_signature(request_data, signature_header):
-    """
-    Enhanced webhook signature verification for GitHub webhooks
-    """
-    try:
-        webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
-
-        logger.info("Starting webhook signature verification")
-
-        if not webhook_secret:
-            logger.error("GITHUB_WEBHOOK_SECRET environment variable is not set")
-            return False
-
-        if not signature_header:
-            logger.error("No X-Hub-Signature-256 header received")
-            return False
-
-        if not signature_header.startswith("sha256="):
-            logger.error("Signature header doesn't start with sha256=")
-            return False
-
-        # Get the raw signature without 'sha256=' prefix
-        received_signature = signature_header.replace("sha256=", "")
-
-        # Ensure webhook_secret is bytes
-        if isinstance(webhook_secret, str):
-            webhook_secret = webhook_secret.strip().encode("utf-8")
-
-        # Ensure request_data is bytes
-        if isinstance(request_data, str):
-            request_data = request_data.encode("utf-8")
-
-        # Calculate expected signature
-        mac = hmac.new(webhook_secret, msg=request_data, digestmod=hashlib.sha256)
-        expected_signature = mac.hexdigest()
-
-        # Debug logging
-        logger.debug("Signature Details:")
-        logger.debug(f"Request Data Length: {len(request_data)} bytes")
-        logger.debug(f"Secret Key Length: {len(webhook_secret)} bytes")
-        logger.debug(f"Raw Request Data: {request_data[:100]}...")  # First 100 bytes
-        logger.debug(f"Received Header: {signature_header}")
-        logger.debug(f"Calculated HMAC: sha256={expected_signature}")
-
-        # Use constant time comparison
-        is_valid = hmac.compare_digest(expected_signature, received_signature)
-
-        if not is_valid:
-            logger.error("Signature mismatch detected")
-            logger.error(f"Header format: {signature_header}")
-            logger.error(f"Received signature: {received_signature[:10]}...")
-            logger.error(f"Expected signature: {expected_signature[:10]}...")
-
-            # Additional debug info
-            if os.getenv("FLASK_ENV") != "production":
-                logger.debug("Full signature comparison:")
-                logger.debug(f"Full received: {received_signature}")
-                logger.debug(f"Full expected: {expected_signature}")
-        else:
-            logger.info("Webhook signature verified successfully")
-
-        return is_valid
-
-    except Exception as e:
-        logger.error(f"Signature verification failed: {str(e)}")
+        logger.error(f"Webhook error: {str(e)}")
         logger.error(traceback.format_exc())
-        return False
+        return jsonify({"error": "Internal server error"}), 500
 
 
-@app.route("/debug/test-webhook", methods=["POST"])
-def test_webhook():
-    """Test endpoint to verify webhook signatures"""
-    if os.getenv("FLASK_ENV") != "production":
-        try:
-            webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
-            raw_data = request.get_data()
-            received_signature = request.headers.get("X-Hub-Signature-256")
-
-            # Test with the exact data received
-            result = verify_webhook_signature(raw_data, received_signature)
-
-            # Calculate signature for debugging
-            mac = hmac.new(
-                (
-                    webhook_secret.encode("utf-8")
-                    if isinstance(webhook_secret, str)
-                    else webhook_secret
-                ),
-                msg=raw_data,
-                digestmod=hashlib.sha256,
-            )
-            expected_signature = f"sha256={mac.hexdigest()}"
-
-            return jsonify(
-                {
-                    "webhook_secret_configured": bool(webhook_secret),
-                    "webhook_secret_length": (
-                        len(webhook_secret) if webhook_secret else 0
-                    ),
-                    "received_signature": received_signature,
-                    "expected_signature": expected_signature,
-                    "payload_size": len(raw_data),
-                    "signatures_match": result,
-                    "raw_data_preview": (
-                        raw_data.decode("utf-8")[:100] if raw_data else None
-                    ),
-                }
-            )
-        except Exception as e:
-            return jsonify({"error": str(e)})
-    return jsonify({"message": "Not available in production"}), 403
-
-
-def clean_directory(directory):
-    """Safely remove a directory"""
+def format_semgrep_results(semgrep_output):
+    """Format Semgrep output into a structured response"""
     try:
-        if os.path.exists(directory):
-            shutil.rmtree(directory)
-    except Exception as e:
-        logger.error(f"Error cleaning directory {directory}: {str(e)}")
-
-
-def trigger_semgrep_analysis(repo_url, installation_token, user_id):
-    """Run Semgrep analysis with enhanced error handling"""
-    clone_dir = None
-    repo_name = repo_url.split("github.com/")[-1].replace(".git", "")
-
-    try:
-        repo_url_with_auth = (
-            f"https://x-access-token:{installation_token}@github.com/{repo_name}.git"
-        )
-        clone_dir = f"/tmp/semgrep_{repo_name.replace('/', '_')}_{os.getpid()}"
-
-        # Create initial database entry
-        analysis = AnalysisResult(
-            repository_name=repo_name, user_id=user_id, status="in_progress"
-        )
-        db.session.add(analysis)
-        db.session.commit()
-        logger.info(f"Created analysis record with ID: {analysis.id}")
-
-        # Clean directory first
-        clean_directory(clone_dir)
-        logger.info(f"Cloning repository to {clone_dir}")
-
-        # Enhanced clone command with detailed error capture
-        try:
-            # First verify the repository exists and is accessible
-            test_url = f"https://api.github.com/repos/{repo_name}"
-            headers = {
-                "Authorization": f"Bearer {installation_token}",
-                "Accept": "application/vnd.github.v3+json",
-            }
-
-            logger.info(f"Verifying repository access: {test_url}")
-
-            response = requests.get(test_url, headers=headers)
-            if response.status_code != 200:
-                raise ValueError(
-                    f"Repository verification failed: {response.status_code} - {response.text}"
-                )
-
-            # Clone with more detailed error output
-            #  depth=2 to get the current commit and its parent diff support
-            clone_result = subprocess.run(
-                ["git", "clone", "--depth", "2", repo_url_with_auth, clone_dir],
-                capture_output=True,
-                text=True,
-            )
-
-            if clone_result.returncode != 0:
-                error_msg = (
-                    f"Git clone failed with return code {clone_result.returncode}\n"
-                    f"STDERR: {clone_result.stderr}\n"
-                    f"STDOUT: {clone_result.stdout}"
-                )
-                logger.error(error_msg)
-                raise Exception(error_msg)
-
-            logger.info(f"Repository cloned successfully: {repo_name}")
-
-            # Run semgrep analysis
-            semgrep_cmd = ["semgrep", "--config=auto", "--json", "."]
-            logger.info(f"Running semgrep with command: {' '.join(semgrep_cmd)}")
-
-            semgrep_process = subprocess.run(
-                semgrep_cmd, capture_output=True, text=True, check=True, cwd=clone_dir
-            )
-
+        if isinstance(semgrep_output, str):
             try:
-                semgrep_output = json.loads(semgrep_process.stdout)
-                analysis.status = "completed"
-                analysis.results = semgrep_output
-                db.session.commit()
-
-                logger.info(f"Semgrep analysis completed successfully for {repo_name}")
-                return semgrep_process.stdout
-
-            except json.JSONDecodeError as e:
-                error_msg = f"Failed to parse Semgrep output: {str(e)}"
-                logger.error(error_msg)
-                analysis.status = "failed"
-                analysis.error = error_msg
-                db.session.commit()
-                return None
-
-        except subprocess.CalledProcessError as e:
-            error_msg = (
-                f"Command '{' '.join(e.cmd)}' failed with return code {e.returncode}\n"
-                f"STDERR: {e.stderr}\n"
-                f"STDOUT: {e.stdout}"
-            )
-            logger.error(error_msg)
-            if "analysis" in locals():
-                analysis.status = "failed"
-                analysis.error = error_msg
-                db.session.commit()
-            raise Exception(error_msg)
-
-    except Exception as e:
-        logger.error(f"Analysis error for {repo_name}: {str(e)}")
-        if "analysis" in locals():
-            analysis.status = "failed"
-            analysis.error = str(e)
-            db.session.commit()
-        return None
-
-    finally:
-        if clone_dir:
-            clean_directory(clone_dir)
-
-
-def format_semgrep_results(raw_results):
-    """Format Semgrep results for frontend"""
-    try:
-        # Handle string input
-        if isinstance(raw_results, str):
-            try:
-                results = json.loads(raw_results)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON results: {str(e)}")
+                semgrep_data = json.loads(semgrep_output)
+            except json.JSONDecodeError:
+                logger.error("Failed to parse Semgrep output as JSON")
                 return {
                     "summary": {
                         "total_files_scanned": 0,
@@ -1667,27 +667,30 @@ def format_semgrep_results(raw_results):
                         "INFO": [],
                     },
                     "findings_by_category": {},
-                    "errors": [f"Failed to parse results: {str(e)}"],
+                    "errors": ["Failed to parse Semgrep output"],
                     "severity_counts": {},
                     "category_counts": {},
                 }
         else:
-            results = raw_results
-
-        if not isinstance(results, dict):
-            raise ValueError(
-                f"Invalid results format: expected dict, got {type(results)}"
-            )
+            semgrep_data = semgrep_output
 
         formatted_response = {
             "summary": {
-                "total_files_scanned": len(results.get("paths", {}).get("scanned", [])),
-                "total_findings": len(results.get("results", [])),
-                "files_scanned": results.get("paths", {}).get("scanned", []),
-                "semgrep_version": results.get("version", "unknown"),
-                "scan_status": (
-                    "success" if not results.get("errors") else "completed_with_errors"
+                "total_files_scanned": len(
+                    set(
+                        result.get("path", "")
+                        for result in semgrep_data.get("results", [])
+                    )
                 ),
+                "total_findings": len(semgrep_data.get("results", [])),
+                "files_scanned": list(
+                    set(
+                        result.get("path", "")
+                        for result in semgrep_data.get("results", [])
+                    )
+                ),
+                "semgrep_version": semgrep_data.get("version", "unknown"),
+                "scan_status": "completed",
             },
             "findings": [],
             "findings_by_severity": {
@@ -1698,12 +701,20 @@ def format_semgrep_results(raw_results):
                 "INFO": [],
             },
             "findings_by_category": {},
-            "errors": results.get("errors", []),
+            "errors": semgrep_data.get("errors", []),
+            "severity_counts": {},
+            "category_counts": {},
         }
 
-        for finding in results.get("results", []):
+        for finding in semgrep_data.get("results", []):
             try:
-                severity = finding.get("extra", {}).get("severity", "INFO")
+                severity = (
+                    finding.get("extra", {})
+                    .get("severity", "INFO")
+                    .upper()
+                    .replace("ERROR", "HIGH")
+                )
+
                 category = (
                     finding.get("extra", {})
                     .get("metadata", {})
