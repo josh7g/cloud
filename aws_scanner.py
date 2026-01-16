@@ -416,7 +416,7 @@ class AwsSecurityScanner(BaseCloudScanner):
     def _process_group(self, group, findings, category_counts, severity_counts, status_counts, account_id):
         """Recursively process benchmark groups and controls"""
         # Process controls in this group
-        if 'controls' in group:
+        if 'controls' in group and group['controls'] is not None:
             for control in group['controls']:
                 finding = self._process_control(control, account_id)
                 if finding:
@@ -433,7 +433,7 @@ class AwsSecurityScanner(BaseCloudScanner):
                     status_counts[status] = status_counts.get(status, 0) + 1
         
         # Recursively process child groups
-        if 'groups' in group:
+        if 'groups' in group and group['groups'] is not None:
             for child_group in group['groups']:
                 self._process_group(child_group, findings, category_counts, severity_counts, status_counts, account_id)
     
