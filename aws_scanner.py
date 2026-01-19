@@ -548,133 +548,214 @@ class AwsSecurityScanner(BaseCloudScanner):
         return await self.steampipe_service.collect_config_data(aws_queries)
 
 
-# ============================================================================
-# Handler Functions for Provider Registry
-# ============================================================================
-
-async def scan_aws_account_handler(
-    user_id: str,
-    account_id: str,
-    credentials: Dict[str, str],
-    db_session,
-    scan_record,
-    **kwargs
-) -> Dict[str, Any]:
+async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Handler function for AWS account scanning - used by UnifiedCloudAPI
     
     Args:
-        user_id: User identifier
-        account_id: AWS account ID
-        credentials: AWS credentials (can include role_arn for role assumption)
-        db_session: SQLAlchemy session
-        scan_record: CloudScan database record
-        **kwargs: Additional parameters (cloudname, scan_id, etc.)
+        request_data: Dict containing all scan parameters:
+            - user_id: User identifier
+            - account_id: AWS account ID
+            - credentials: AWS credentials (optional if using role_arn)
+            - role_arn: IAM role ARN (optional, for cross-account access)
+            - external_id: External ID for role assumption (optional)
+            - session_name: Session name for assumed role (optional)
+            - aws_cloudname: Friendly name for this scan
+            - worksheet_number: Worksheet number (default: 1)
+            - workspace_id: Workspace identifier (optional)
     
     Returns:
-        Dict with scan results
+        Dict with scan results and status
     """
+    from models import CloudScan
+    from db_utils import create_db_engine
+    from sqlalchemy.orm import Session
+    import threading
+    import traceback
+    
+    db_session = None
+    engine = None
+    scan_record = None
+    
     try:
-        logger.info(f"AWS scan handler called for {user_id}:{account_id}")
+        # Extract parameters from request_data
+        user_id = request_data.get('user_id')
+        account_id = request_data.get('account_id')
+        credentials = request_data.get('credentials', {})
+        aws_cloudname = request_data.get('aws_cloudname') or request_data.get('cloudname')
+        worksheet_number = request_data.get('worksheet_number', 1)
+        workspace_id = request_data.get('workspace_id')
         
-        # Create scanner instance
-        async with AwsSecurityScanner(db_session, scan_record) as scanner:
-            # Extract optional parameters
-            scan_id = kwargs.get('scan_id')
-            cloudname = kwargs.get('cloudname')
+        # Handle role assumption parameters
+        role_arn = request_data.get('role_arn')
+        external_id = request_data.get('external_id')
+        session_name = request_data.get('session_name', f'SecurityScan-{int(time.time())}')
+        
+        logger.info(f"AWS scan handler called for user: {user_id}, account: {account_id}, cloudname: {aws_cloudname}")
+        
+        # Validate required parameters
+        if not user_id or not account_id:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Missing required parameters: user_id and account_id',
+                    'code': 'MISSING_PARAMETERS'
+                }
+            }
+        
+        if not aws_cloudname:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Missing required parameter: aws_cloudname or cloudname',
+                    'code': 'MISSING_CLOUDNAME'
+                }
+            }
+        
+        # Validate authentication method
+        use_direct_credentials = bool(credentials.get('aws_access_key_id') and credentials.get('aws_secret_access_key'))
+        use_role_assumption = bool(role_arn)
+        
+        if not use_direct_credentials and not use_role_assumption:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Must provide either credentials (aws_access_key_id, aws_secret_access_key) OR role_arn',
+                    'code': 'NO_AUTH_METHOD'
+                }
+            }
+        
+        # If role_arn is provided, prepare credentials for role assumption
+        if role_arn:
+            logger.info(f"Using role assumption: {role_arn}")
+            # Put role info into credentials dict for compatibility with existing scanner code
+            credentials = credentials.copy()
+            credentials['role_arn'] = role_arn
+            if external_id:
+                credentials['external_id'] = external_id
+            credentials['session_name'] = session_name
+        
+        # Create database session and scan record
+        engine = create_db_engine()
+        db_session = Session(engine)
+        
+        # Create scan record
+        scan_record = CloudScan(
+            user_id=user_id,
+            cloud_provider='aws',
+            account_id=account_id,
+            cloudname=aws_cloudname,
+            worksheet_number=worksheet_number,
+            workspace_id=workspace_id,
+            status='in_progress'
+        )
+        
+        db_session.add(scan_record)
+        db_session.commit()
+        db_session.refresh(scan_record)
+        
+        scan_id = scan_record.id
+        logger.info(f"Created scan record with ID: {scan_id}")
+        
+        # Run scan in background
+        def run_scan_background():
+            """Run scan in background thread"""
+            import asyncio
             
-            # Run the scan using base class method
-            results = await scanner.scan_account(
-                user_id=user_id,
-                account_id=account_id,
-                credentials=credentials,
-                scan_id=scan_id,
-                cloudname=cloudname
-            )
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
-            return results
-            
+            try:
+                # Create scanner instance with context manager
+                async def run_scan():
+                    async with AwsSecurityScanner(db_session, scan_record) as scanner:
+                        # Run the scan
+                        await scanner.scan_account(
+                            user_id=user_id,
+                            account_id=account_id,
+                            credentials=credentials,
+                            scan_id=scan_id,
+                            cloudname=aws_cloudname
+                        )
+                
+                loop.run_until_complete(run_scan())
+                logger.info(f"Scan {scan_id} completed successfully")
+                
+            except Exception as e:
+                logger.error(f"Background scan {scan_id} failed: {str(e)}")
+                logger.error(traceback.format_exc())
+                try:
+                    scan_record.status = 'failed'
+                    scan_record.error = str(e)
+                    db_session.commit()
+                except Exception as commit_error:
+                    logger.error(f"Failed to update scan record: {str(commit_error)}")
+            finally:
+                loop.close()
+                try:
+                    db_session.close()
+                    engine.dispose()
+                except:
+                    pass
+        
+        # Start background thread
+        scan_thread = threading.Thread(target=run_scan_background, daemon=True)
+        scan_thread.start()
+        
+        # Return immediately with scan_id
+        return {
+            'success': True,
+            'scan_id': scan_id,
+            'status': 'in_progress',
+            'message': 'AWS security scan initiated successfully',
+            'data': {
+                'scan_id': scan_id,
+                'user_id': user_id,
+                'account_id': account_id,
+                'cloudname': aws_cloudname,
+                'worksheet_number': worksheet_number,
+                'workspace_id': workspace_id
+            }
+        }
+        
     except Exception as e:
-        logger.error(f"AWS scan handler error: {str(e)}", exc_info=True)
+        logger.error(f"Error initiating AWS scan: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Try to update scan record if it exists
+        if scan_record and db_session:
+            try:
+                scan_record.status = 'failed'
+                scan_record.error = str(e)
+                db_session.commit()
+            except Exception as update_error:
+                logger.error(f"Failed to update scan record: {str(update_error)}")
+        
         return {
             'success': False,
             'error': {
-                'message': str(e),
-                'code': 'AWS_SCAN_ERROR',
-                'type': type(e).__name__
+                'message': 'Failed to initiate AWS scan',
+                'code': 'SCAN_INIT_ERROR',
+                'details': str(e)
             }
         }
 
 
-async def validate_aws_credentials(
-    credentials: Dict[str, str] = None, 
-    account_id: str = None,
-    role_arn: str = None,
-    external_id: str = None,
-    session_name: str = None
-) -> Dict[str, Any]:
+async def validate_aws_credentials(credentials: Dict[str, str], account_id: str = None) -> Dict[str, Any]:
     """
     Validate AWS credentials - wrapper for UnifiedCloudAPI
     
     Args:
-        credentials: AWS credentials dict (optional if using role_arn)
+        credentials: AWS credentials dict
         account_id: Optional expected account ID
-        role_arn: Optional IAM role ARN for cross-account access
-        external_id: Optional external ID for role assumption
-        session_name: Optional session name for assumed role
     
     Returns:
-        Dict with success status and validation results
+        Dict with validation results
     """
     validator = AwsCredentialValidator()
     
-    # Default credentials to empty dict if not provided
-    if credentials is None:
-        credentials = {}
-    
     # Check if role assumption is needed
-    if role_arn:
-        # Use app's own credentials for role assumption
-        base_creds = {
-            'aws_access_key_id': os.getenv('AWS_ACCESS_KEY_ID'),
-            'aws_secret_access_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
-            'aws_session_token': os.getenv('AWS_SESSION_TOKEN')
-        }
-        
-        # If credentials were provided, use those instead of env vars
-        if credentials.get('aws_access_key_id'):
-            base_creds = credentials
-        
-        role_config = {
-            'role_arn': role_arn,
-            'external_id': external_id,
-            'session_name': session_name or f'SecurityScan-{int(time.time())}'
-        }
-        
-        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'role_assumption'
-                }
-            }
-        else:
-            return {
-                'success': False,
-                'error': {
-                    'message': 'Role assumption failed',
-                    'code': 'INVALID_ROLE',
-                    'details': ', '.join(result.get('errors', []))
-                }
-            }
-    
-    # Legacy path: check if role info is inside credentials dict
-    elif 'role_arn' in credentials:
+    if 'role_arn' in credentials:
         base_creds = {
             'aws_access_key_id': credentials.get('aws_access_key_id'),
             'aws_secret_access_key': credentials.get('aws_secret_access_key'),
@@ -687,48 +768,6 @@ async def validate_aws_credentials(
             'session_name': credentials.get('session_name', f'SecurityScan-{int(time.time())}')
         }
         
-        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'role_assumption'
-                }
-            }
-        else:
-            return {
-                'success': False,
-                'error': {
-                    'message': 'Role assumption failed',
-                    'code': 'INVALID_ROLE',
-                    'details': ', '.join(result.get('errors', []))
-                }
-            }
-    
-    # Direct credentials validation
+        return await validator.validate_credentials_with_role(base_creds, account_id, role_config)
     else:
-        result = await validator.validate_credentials(credentials, account_id)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'direct_credentials'
-                }
-            }
-        else:
-            return {
-                'success': False,
-                'error': {
-                    'message': 'Invalid credentials',
-                    'code': 'INVALID_CREDENTIALS',
-                    'details': ', '.join(result.get('errors', []))
-                }
-            }
+        return await validator.validate_credentials(credentials, account_id)
