@@ -1,734 +1,799 @@
 """
-AWS Security Scanner - Refactored to use unified cloud scanner architecture
+Unified Cloud API - Single set of endpoints for all cloud providers
 """
-import os
-import json
 import logging
-import asyncio
-import boto3
-from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from pathlib import Path
-import time
-
-from cloud_scanner.base_scanner import BaseCloudScanner
-from cloud_scanner.steampipe_service import SteampipeService, STEAMPIPE_CONFIGS
+import traceback
+from flask import Blueprint, request, jsonify, make_response
+from typing import Dict, Optional
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import text
+from models import CloudScan, db
+from db_utils import create_db_engine
+from cloud_scanner.provider_registry import CloudProviderRegistry
 
 logger = logging.getLogger(__name__)
 
 
-class AwsCredentialValidator:
-    """Validates AWS credentials using boto3"""
+class UnifiedCloudAPI:
+    """
+    Unified API for all cloud providers.
+    All providers use the same endpoints with provider specified in request body or query params.
+    """
     
-    @staticmethod
-    async def validate_credentials(credentials: Dict[str, str], account_id: str = None) -> Dict[str, Any]:
-        """
-        Validate AWS credentials by calling STS GetCallerIdentity
-        
-        Args:
-            credentials: Dict with aws_access_key_id, aws_secret_access_key, aws_session_token
-            account_id: Optional expected account ID to validate against
-            
-        Returns:
-            Dict with validation results
-        """
-        logger.info("Starting AWS credential validation")
-        
-        results = {
-            "valid": False,
-            "account_id": None,
-            "caller_identity": None,
-            "errors": []
-        }
-        
-        try:
-            # Create boto3 session with provided credentials
-            session = boto3.Session(
-                aws_access_key_id=credentials.get('aws_access_key_id'),
-                aws_secret_access_key=credentials.get('aws_secret_access_key'),
-                aws_session_token=credentials.get('aws_session_token')
+    def __init__(self):
+        # Define blueprint without prefix; app.py will mount it at /api/v1/cloud
+        self.blueprint = Blueprint('cloud', __name__)
+        self.registry = CloudProviderRegistry()
+        self._register_cors_handler()
+        self._register_routes()
+    
+    def _register_cors_handler(self):
+        """Register CORS handler for all routes on this blueprint"""
+
+        @self.blueprint.before_request
+        def handle_preflight():
+            """Handle OPTIONS preflight requests at the blueprint level"""
+            if request.method == 'OPTIONS':
+                response = make_response('', 200)
+                response.headers['Access-Control-Allow-Origin'] = '*'
+                response.headers['Access-Control-Allow-Headers'] = (
+                    'Content-Type,Authorization,X-Requested-With,'
+                    'workspace-id,organization-id,accesstoken,accessToken'
+                )
+                response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+                response.headers['Access-Control-Max-Age'] = '3600'
+                response.headers['Access-Control-Allow-Credentials'] = 'false'
+                return response
+
+        @self.blueprint.after_request
+        def after_request(response):
+            """Add CORS headers to all responses for this blueprint"""
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Headers'] = (
+                'Content-Type,Authorization,X-Requested-With,'
+                'workspace-id,organization-id,accesstoken,accessToken'
             )
+            response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+            response.headers['Access-Control-Max-Age'] = '3600'
+            response.headers['Access-Control-Allow-Credentials'] = 'false'
+            return response
+    
+    def _register_routes(self):
+        """Register unified routes for all cloud providers"""
+        
+        @self.blueprint.route('/scan', methods=['POST'])
+        def trigger_scan():
+            """Trigger a cloud security scan - provider specified in request"""
+            return self._handle_scan_request()
+        
+        # Register more specific routes first (with int converters) before general routes
+        # These must come before /scans/<user_id> routes to avoid conflicts
+        # IMPORTANT: Routes with path segments (like /result, /reranked) must come before
+        # routes without path segments to ensure proper matching
+        @self.blueprint.route('/scans/<int:scan_id>/result', methods=['GET'])
+        def get_scan_result(scan_id):
+            """Get scan result by scan ID"""
+            return self._handle_get_scan_result(scan_id)
+        
+        @self.blueprint.route('/scans/<int:scan_id>/reranked', methods=['GET'])
+        def get_reranked_by_scan_id(scan_id):
+            """Get reranked findings by scan ID"""
+            return self._handle_get_reranked_by_scan_id(scan_id)
+        
+        @self.blueprint.route('/scans/<int:scan_id>', methods=['DELETE'])
+        def delete_scan(scan_id):
+            """Delete a scan"""
+            return self._handle_delete_scan(scan_id)
+        
+        # Register user-based routes after scan_id routes to avoid conflicts
+        # Use string converter explicitly to ensure these don't match integers
+        # IMPORTANT: Routes with /list must come before routes without path segments
+        @self.blueprint.route('/scans/<string:user_id>/list', methods=['GET'])
+        def list_user_scans(user_id):
+            """List all scans for a user - optionally filter by provider"""
+            return self._handle_list_scans(user_id)
+        
+        # This route must come last among /scans routes to avoid matching /scans/125/reranked
+        # as /scans/<string:user_id> where user_id = "125/reranked"
+        @self.blueprint.route('/scans/<string:user_id>', methods=['GET'])
+        def get_user_scans(user_id):
+            """Get user scans with filtering"""
+            return self._handle_get_user_scans(user_id)
+        
+        @self.blueprint.route('/scans/<string:user_id>/cloudname/<cloudname>/result', methods=['GET'])
+        def get_scan_result_by_cloudname(user_id, cloudname):
+            """Get scan result by user ID and cloudname"""
+            return self._handle_get_scan_result_by_cloudname(user_id, cloudname)
+        
+        @self.blueprint.route('/scans/<string:user_id>/cloudname/<cloudname>/reranked', methods=['GET'])
+        def get_reranked_findings_by_cloudname(user_id, cloudname):
+            """Get reranked findings by user ID and cloudname"""
+            return self._handle_get_reranked_by_cloudname(user_id, cloudname)
+        
+        @self.blueprint.route('/scans/<string:user_id>/cloudname/<cloudname>/worksheet/<int:worksheet_number>/reranked', methods=['GET'])
+        def get_reranked_by_cloudname_and_worksheet(user_id, cloudname, worksheet_number):
+            """Get reranked findings by cloudname and worksheet"""
+            return self._handle_get_reranked_by_cloudname_and_worksheet(user_id, cloudname, worksheet_number)
+        
+        @self.blueprint.route('/scans/<string:user_id>/cloudname/<cloudname>/worksheets', methods=['GET'])
+        def list_worksheets_for_cloudname(user_id, cloudname):
+            """List worksheets for a cloudname"""
+            return self._handle_list_worksheets(user_id, cloudname)
+        
+        @self.blueprint.route('/scans/<string:user_id>/cloudname/<cloudname>/worksheet/<int:worksheet_number>/result', methods=['GET'])
+        def get_scan_result_by_cloudname_and_worksheet(user_id, cloudname, worksheet_number):
+            """Get scan result by cloudname and worksheet"""
+            return self._handle_get_scan_result_by_cloudname_and_worksheet(user_id, cloudname, worksheet_number)
+        
+        @self.blueprint.route('/security/summary/<user_id>', methods=['GET'])
+        def get_security_summary(user_id):
+            """Get security summary for a user - optionally filter by provider"""
+            return self._handle_get_security_summary(user_id)
+        
+        @self.blueprint.route('/validate-credentials', methods=['POST'])
+        def validate_credentials():
+            """Validate cloud provider credentials - provider specified in request"""
+            return self._handle_validate_credentials()
+        
+        @self.blueprint.route('/providers', methods=['GET'])
+        def list_providers():
+            """List all available cloud providers"""
+            return jsonify({
+                'providers': self.registry.list_providers()
+            }), 200
+    
+    def _get_provider_from_request(self) -> Optional[str]:
+        """Extract provider name from request (body or query param)"""
+        if request.is_json:
+            data = request.get_json() or {}
+            provider = data.get('provider') or data.get('cloud_provider')
+            if provider:
+                return provider.lower()
+        
+        provider = request.args.get('provider') or request.args.get('cloud_provider')
+        if provider:
+            return provider.lower()
+        
+        return None
+    
+    def _get_workspace_id_from_request(self) -> Optional[str]:
+        """Extract workspace_id from request headers or body"""
+        # First check headers (preferred method)
+        workspace_id = request.headers.get('workspace-id') or request.headers.get('workspace_id')
+        if workspace_id:
+            logger.debug(f"Extracted workspace_id from headers: {workspace_id}")
+            return workspace_id.strip()
+        
+        # Fallback to request body (for POST requests)
+        if request.is_json:
+            data = request.get_json() or {}
+            workspace_id = data.get('workspace_id')
+            if workspace_id:
+                logger.debug(f"Extracted workspace_id from request body: {workspace_id}")
+                return str(workspace_id).strip()
+        
+        # Fallback to query params (for GET requests)
+        workspace_id = request.args.get('workspace_id')
+        if workspace_id:
+            logger.debug(f"Extracted workspace_id from query params: {workspace_id}")
+            return str(workspace_id).strip()
+        
+        logger.debug("No workspace_id found in request")
+        return None
+    
+    def _handle_scan_request(self):
+        """Handle cloud scan request - delegates to provider-specific handler"""
+        try:
+            data = request.get_json() or {}
+            provider = self._get_provider_from_request()
             
-            # Test credentials with STS GetCallerIdentity
-            sts_client = session.client('sts')
+            if not provider:
+                return jsonify({
+                    'error': 'Missing required field: provider or cloud_provider'
+                }), 400
+            
+            # Check if provider is registered
+            if not self.registry.is_provider_registered(provider):
+                return jsonify({
+                    'error': f'Provider {provider} is not registered',
+                    'available_providers': self.registry.list_providers()
+                }), 400
+            
+            # Get the scan handler for this provider
+            scan_handler = self.registry.get_scan_handler(provider)
+            if not scan_handler:
+                return jsonify({
+                    'error': f'Scan handler not found for provider {provider}'
+                }), 500
+            
+            # Extract workspace_id from request
+            workspace_id = self._get_workspace_id_from_request()
+            if workspace_id:
+                data['workspace_id'] = workspace_id
+                logger.info(f"Including workspace_id in scan request: {workspace_id}")
+            
+            # Call the provider-specific scan handler
+            import asyncio
+            result = asyncio.run(scan_handler(data))
+            
+            return jsonify(result), 200
+            
+        except Exception as e:
+            logger.error(f"Error handling scan request: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_scan_result(self, scan_id: int):
+        """Get scan result by scan ID"""
+        try:
+            engine = create_db_engine()
+            session = Session(engine)
             
             try:
-                response = sts_client.get_caller_identity()
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
                 
-                results['valid'] = True
-                results['account_id'] = response['Account']
-                results['caller_identity'] = {
-                    'arn': response['Arn'],
-                    'user_id': response['UserId'],
-                    'account': response['Account']
-                }
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
                 
-                logger.info(f"✓ Credentials valid for account: {response['Account']}")
+                return jsonify(scan.to_dict()), 200
                 
-                # Validate against expected account_id if provided
-                if account_id and results['account_id'] != account_id:
-                    results['valid'] = False
-                    results['errors'].append(
-                        f"Account ID mismatch: expected {account_id}, got {results['account_id']}"
-                    )
-                
-            except ClientError as e:
-                error_code = e.response['Error']['Code']
-                error_message = e.response['Error']['Message']
-                logger.error(f"✗ STS GetCallerIdentity failed: {error_code} - {error_message}")
-                results['errors'].append(f"Authentication failed: {error_code} - {error_message}")
+            finally:
+                session.close()
+                engine.dispose()
                 
         except Exception as e:
-            logger.error(f"✗ Credential validation error: {str(e)}")
-            results['errors'].append(f"Validation error: {str(e)}")
-        
-        return results
+            logger.error(f"Error getting scan result: {str(e)}")
+            return jsonify({'error': str(e)}), 500
     
-    @staticmethod
-    async def validate_credentials_with_role(
-        base_credentials: Dict[str, str],
-        account_id: str,
-        role_config: Dict[str, str]
-    ) -> Dict[str, Any]:
-        """
-        Validate credentials by assuming a role
-        
-        Args:
-            base_credentials: Base AWS credentials to assume role with
-            account_id: Expected AWS account ID
-            role_config: Dict with role_arn, external_id, session_name
-            
-        Returns:
-            Dict with validation results
-        """
-        logger.info(f"Validating credentials by assuming role: {role_config.get('role_arn')}")
-        
-        results = {
-            "valid": False,
-            "account_id": None,
-            "caller_identity": None,
-            "assumed_role": None,
-            "errors": []
-        }
-        
+    def _handle_get_reranked_by_scan_id(self, scan_id: int):
+        """Get reranked findings by scan ID"""
         try:
-            # Create session with base credentials
-            session = boto3.Session(
-                aws_access_key_id=base_credentials.get('aws_access_key_id'),
-                aws_secret_access_key=base_credentials.get('aws_secret_access_key'),
-                aws_session_token=base_credentials.get('aws_session_token')
-            )
+            engine = create_db_engine()
+            session = Session(engine)
             
-            sts_client = session.client('sts')
-            
-            # Prepare assume role parameters
-            assume_role_params = {
-                'RoleArn': role_config['role_arn'],
-                'RoleSessionName': role_config.get('session_name', f'SecurityScan-{int(time.time())}'),
-                'DurationSeconds': 3600
-            }
-            
-            if role_config.get('external_id'):
-                assume_role_params['ExternalId'] = role_config['external_id']
-            
-            # Assume the role
             try:
-                response = sts_client.assume_role(**assume_role_params)
-                credentials_data = response['Credentials']
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
                 
-                # Create new session with assumed role credentials
-                assumed_session = boto3.Session(
-                    aws_access_key_id=credentials_data['AccessKeyId'],
-                    aws_secret_access_key=credentials_data['SecretAccessKey'],
-                    aws_session_token=credentials_data['SessionToken']
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
+                
+                if not scan.rerank:
+                    return jsonify({'error': 'No reranked findings available'}), 404
+                
+                return jsonify({
+                    'scan_id': scan.id,
+                    'reranked_findings': scan.rerank
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting reranked findings: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_delete_scan(self, scan_id: int):
+        """Delete a scan"""
+        try:
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
+                
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
+                
+                session.delete(scan)
+                session.commit()
+                
+                return jsonify({'message': 'Scan deleted successfully'}), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error deleting scan: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_list_scans(self, user_id: str):
+        """List all scans for a user - optionally filter by provider and workspace"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(CloudScan.user_id == user_id)
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scans = query.order_by(CloudScan.created_at.desc()).all()
+                
+                return jsonify({
+                    'scans': [scan.to_dict() for scan in scans],
+                    'count': len(scans),
+                    'provider': provider or 'all',
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error listing scans: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_user_scans(self, user_id: str):
+        """Get user scans with filtering"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            status = request.args.get('status')
+            limit = request.args.get('limit', type=int, default=50)
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(CloudScan.user_id == user_id)
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                if status:
+                    query = query.filter(CloudScan.status == status)
+                
+                scans = query.order_by(CloudScan.created_at.desc()).limit(limit).all()
+                
+                return jsonify({
+                    'scans': [scan.to_dict() for scan in scans],
+                    'count': len(scans),
+                    'filters': {
+                        'provider': provider or 'all',
+                        'status': status or 'all',
+                        'workspace_id': workspace_id
+                    }
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting user scans: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_scan_result_by_cloudname(self, user_id: str, cloudname: str):
+        """Get scan result by cloudname - filter by workspace if provided"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.cloudname == cloudname
                 )
                 
-                # Verify assumed role identity
-                assumed_sts = assumed_session.client('sts')
-                identity = assumed_sts.get_caller_identity()
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scan by workspace_id: {workspace_id}")
                 
-                results['valid'] = True
-                results['account_id'] = identity['Account']
-                results['caller_identity'] = {
-                    'arn': identity['Arn'],
-                    'user_id': identity['UserId'],
-                    'account': identity['Account']
-                }
-                results['assumed_role'] = {
-                    'arn': response['AssumedRoleUser']['Arn'],
-                    'expiration': credentials_data['Expiration'].isoformat()
-                }
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
                 
-                logger.info(f"✓ Successfully assumed role for account: {identity['Account']}")
+                scan = query.order_by(CloudScan.created_at.desc()).first()
                 
-                # Validate against expected account_id
-                if account_id and results['account_id'] != account_id:
-                    results['valid'] = False
-                    results['errors'].append(
-                        f"Account ID mismatch: expected {account_id}, got {results['account_id']}"
-                    )
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
                 
-            except ClientError as e:
-                error_code = e.response['Error']['Code']
-                error_message = e.response['Error']['Message']
-                logger.error(f"✗ AssumeRole failed: {error_code} - {error_message}")
-                results['errors'].append(f"Role assumption failed: {error_code} - {error_message}")
+                return jsonify(scan.to_dict()), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
                 
         except Exception as e:
-            logger.error(f"✗ Role validation error: {str(e)}")
-            results['errors'].append(f"Role validation error: {str(e)}")
-        
-        return results
-
-
-class AwsAssumedRoleCredentials:
-    """Manages AWS assumed role credentials with automatic refresh"""
+            logger.error(f"Error getting scan result: {str(e)}")
+            return jsonify({'error': str(e)}), 500
     
-    def __init__(
+    def _handle_get_reranked_by_cloudname(self, user_id: str, cloudname: str):
+        """Get reranked findings by cloudname - filter by workspace if provided"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.cloudname == cloudname
+                )
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering reranked findings by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scan = query.order_by(CloudScan.created_at.desc()).first()
+                
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
+                
+                if not scan.rerank:
+                    return jsonify({'error': 'No reranked findings available'}), 404
+                
+                return jsonify({
+                    'scan_id': scan.id,
+                    'cloudname': cloudname,
+                    'reranked_findings': scan.rerank,
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting reranked findings: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_reranked_by_cloudname_and_worksheet(
         self, 
-        role_arn: str, 
-        session_name: str = None,
-        external_id: str = None, 
-        base_credentials: Dict[str, str] = None
+        user_id: str, 
+        cloudname: str, 
+        worksheet_number: int
     ):
-        self.role_arn = role_arn
-        self.session_name = session_name or f"SecurityScan-{int(time.time())}"
-        self.external_id = external_id
-        self.base_credentials = base_credentials or {}
-        
-        self.assumed_credentials = None
-        self.credentials_expiry = None
-    
-    async def get_credentials(self) -> Dict[str, str]:
-        """Get valid assumed role credentials, refreshing if necessary"""
+        """Get reranked findings by cloudname and worksheet - filter by workspace if provided"""
         try:
-            if (not self.assumed_credentials or 
-                not self.credentials_expiry or 
-                datetime.now() >= self.credentials_expiry):
-                
-                await self._assume_role()
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
             
-            return self.assumed_credentials
+            engine = create_db_engine()
+            session = Session(engine)
             
-        except Exception as e:
-            logger.error(f"Failed to get assumed role credentials: {str(e)}")
-            raise
-    
-    async def _assume_role(self):
-        """Assume the specified IAM role"""
-        try:
-            logger.info(f"Assuming role: {self.role_arn}")
-            
-            # Create STS client with base credentials
-            if self.base_credentials:
-                session = boto3.Session(
-                    aws_access_key_id=self.base_credentials.get('aws_access_key_id'),
-                    aws_secret_access_key=self.base_credentials.get('aws_secret_access_key'),
-                    aws_session_token=self.base_credentials.get('aws_session_token')
+            try:
+                query = session.query(CloudScan).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.cloudname == cloudname,
+                    CloudScan.worksheet_number == worksheet_number
                 )
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering reranked findings by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scan = query.order_by(CloudScan.created_at.desc()).first()
+                
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
+                
+                if not scan.rerank:
+                    return jsonify({'error': 'No reranked findings available'}), 404
+                
+                return jsonify({
+                    'scan_id': scan.id,
+                    'cloudname': cloudname,
+                    'worksheet_number': worksheet_number,
+                    'reranked_findings': scan.rerank,
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting reranked findings: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_list_worksheets(self, user_id: str, cloudname: str):
+        """List worksheets for a cloudname - filter by workspace if provided"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan.worksheet_number).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.cloudname == cloudname
+                )
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering worksheets by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scans = query.distinct().all()
+                worksheets = [scan[0] for scan in scans]
+                
+                return jsonify({
+                    'worksheets': sorted(worksheets),
+                    'count': len(worksheets),
+                    'provider': provider or 'all',
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error listing worksheets: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_scan_result_by_cloudname_and_worksheet(
+        self, 
+        user_id: str, 
+        cloudname: str, 
+        worksheet_number: int
+    ):
+        """Get scan result by cloudname and worksheet - filter by workspace if provided"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.cloudname == cloudname,
+                    CloudScan.worksheet_number == worksheet_number
+                )
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scan by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scan = query.order_by(CloudScan.created_at.desc()).first()
+                
+                if not scan:
+                    return jsonify({'error': 'Scan not found'}), 404
+                
+                return jsonify(scan.to_dict()), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting scan result: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_security_summary(self, user_id: str):
+        """Get security summary for a user - optionally filter by provider and workspace"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(
+                    CloudScan.user_id == user_id,
+                    CloudScan.status == 'completed'
+                )
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering security summary by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scans = query.all()
+                
+                total_scans = len(scans)
+                total_findings = 0
+                severity_counts = {}
+                provider_counts = {}
+                
+                for scan in scans:
+                    if scan.findings and isinstance(scan.findings, dict):
+                        stats = scan.findings.get('stats', {})
+                        total_findings += stats.get('total_findings', 0)
+                        sev_counts = stats.get('severity_counts', {})
+                        for sev, count in sev_counts.items():
+                            severity_counts[sev] = severity_counts.get(sev, 0) + count
+                    
+                    # Count by provider
+                    prov = scan.cloud_provider
+                    provider_counts[prov] = provider_counts.get(prov, 0) + 1
+                
+                return jsonify({
+                    'total_scans': total_scans,
+                    'total_findings': total_findings,
+                    'severity_counts': severity_counts,
+                    'provider_counts': provider_counts,
+                    'filtered_provider': provider or 'all',
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting security summary: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_validate_credentials(self):
+        """
+        Validate credentials for any cloud provider.
+        Request body should include:
+        - provider: Cloud provider name (aws, azure, gcp, etc.)
+        - credentials: Provider-specific credentials dict
+        - account_id (optional): Account/subscription/project ID
+        """
+        try:
+            data = request.get_json() or {}
+            provider = self._get_provider_from_request()
+            
+            if not provider:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Missing required field: provider or cloud_provider',
+                        'code': 'MISSING_PROVIDER'
+                    }
+                }), 400
+            
+            # Check if provider is registered
+            if not self.registry.is_provider_registered(provider):
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': f'Provider {provider} is not registered',
+                        'code': 'INVALID_PROVIDER',
+                        'available_providers': self.registry.list_providers()
+                    }
+                }), 400
+            
+            # Get validator for this provider
+            validator = self.registry.get_validator(provider)
+            if not validator:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': f'Credential validation not implemented for {provider}',
+                        'code': 'VALIDATOR_NOT_FOUND'
+                    }
+                }), 501
+            
+            # Extract credentials from request
+            credentials = data.get('credentials', {})
+            
+            # Optional account/subscription/project ID
+            account_id = data.get('account_id')
+            role_arn = data.get('role_arn')  # For AWS role assumption
+            external_id = data.get('external_id')  # For AWS external ID
+            
+            # Validate that we have either credentials OR role_arn (for AWS)
+            if not credentials and not role_arn:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Must provide either credentials or role_arn for validation',
+                        'code': 'MISSING_CREDENTIALS'
+                    }
+                }), 400
+            
+            # Call the provider-specific validator
+            import asyncio
+            
+            # Build validation kwargs based on provider
+            if provider == 'aws' and role_arn:
+                # For AWS role assumption, put role info in credentials dict
+                # to match existing validate_aws_credentials function signature
+                aws_credentials = credentials.copy()
+                aws_credentials['role_arn'] = role_arn
+                if external_id:
+                    aws_credentials['external_id'] = external_id
+                
+                validation_kwargs = {
+                    'credentials': aws_credentials,
+                    'account_id': account_id
+                }
             else:
-                session = boto3.Session()
+                # Standard validation
+                validation_kwargs = {
+                    'credentials': credentials,
+                    'account_id': account_id
+                }
             
-            sts_client = session.client('sts')
+            result = asyncio.run(validator(**validation_kwargs))
             
-            # Prepare assume role parameters
-            assume_role_params = {
-                'RoleArn': self.role_arn,
-                'RoleSessionName': self.session_name,
-                'DurationSeconds': 3600  # 1 hour
-            }
-            
-            if self.external_id:
-                assume_role_params['ExternalId'] = self.external_id
-            
-            # Assume the role
-            response = sts_client.assume_role(**assume_role_params)
-            credentials = response['Credentials']
-            
-            # Store the temporary credentials
-            self.assumed_credentials = {
-                'aws_access_key_id': credentials['AccessKeyId'],
-                'aws_secret_access_key': credentials['SecretAccessKey'],
-                'aws_session_token': credentials['SessionToken']
-            }
-            
-            # Set expiry time (with 5 minute buffer)
-            self.credentials_expiry = credentials['Expiration'] - timedelta(minutes=5)
-            
-            logger.info(f"Successfully assumed role. Credentials expire at: {self.credentials_expiry}")
-            
-        except Exception as e:
-            logger.error(f"Failed to assume role {self.role_arn}: {str(e)}")
-            raise
-
-
-class AwsSecurityScanner(BaseCloudScanner):
-    """
-    AWS Security Scanner using Steampipe/Powerpipe for CIS benchmarks
-    Inherits from BaseCloudScanner for common functionality
-    """
-    
-    def __init__(self, db_session=None, scan_record=None):
-        super().__init__(db_session, scan_record)
-        self.steampipe_service = None
-        self.aws_config = STEAMPIPE_CONFIGS['aws']
-    
-    def get_provider_name(self) -> str:
-        """Return provider name"""
-        return 'aws'
-    
-    async def validate_credentials(self, credentials: Dict[str, str], account_id: str = None) -> Dict[str, Any]:
-        """Validate AWS credentials"""
-        validator = AwsCredentialValidator()
-        
-        # Check if this is role assumption
-        if 'role_arn' in credentials:
-            base_creds = {
-                'aws_access_key_id': credentials.get('aws_access_key_id'),
-                'aws_secret_access_key': credentials.get('aws_secret_access_key'),
-                'aws_session_token': credentials.get('aws_session_token')
-            }
-            
-            role_config = {
-                'role_arn': credentials['role_arn'],
-                'external_id': credentials.get('external_id'),
-                'session_name': credentials.get('session_name', f'SecurityScan-{int(time.time())}')
-            }
-            
-            return await validator.validate_credentials_with_role(base_creds, account_id, role_config)
-        else:
-            return await validator.validate_credentials(credentials, account_id)
-    
-    async def setup(self):
-        """Setup AWS scanner resources"""
-        try:
-            # Create workspace directory
-            self.temp_dir = Path(f"/tmp/aws_scan_{int(time.time())}")
-            self.temp_dir.mkdir(exist_ok=True, parents=True)
-            
-            logger.info(f"AWS scanner workspace: {self.temp_dir}")
-            
-            # Initialize Steampipe service
-            self.steampipe_service = SteampipeService('aws', self.temp_dir)
-            
-            # Initialize Steampipe
-            await self.steampipe_service.initialize_service()
-            
-            # Install AWS plugin
-            await self.steampipe_service.install_plugin(
-                self.aws_config['plugin_name'],
-                self.aws_config['plugin_version']
-            )
-            
-            # Initialize and install compliance mod
-            await self.steampipe_service.initialize_mod()
-            await self.steampipe_service.install_compliance_mod(
-                self.aws_config['compliance_mod']
-            )
-            
-            logger.info("AWS scanner setup complete")
-            
-        except Exception as e:
-            logger.error(f"AWS scanner setup failed: {str(e)}")
-            raise
-    
-    async def cleanup(self):
-        """Clean up temporary resources"""
-        try:
-            if self.temp_dir and self.temp_dir.exists():
-                import shutil
-                shutil.rmtree(self.temp_dir, ignore_errors=True)
-                logger.info(f"Cleaned up workspace: {self.temp_dir}")
-        except Exception as e:
-            logger.warning(f"Cleanup warning: {str(e)}")
-    
-    async def run_compliance_check(self, account_id: str) -> Dict[str, Any]:
-        """Run AWS CIS compliance check using Steampipe"""
-        try:
-            if not self.steampipe_service:
-                raise RuntimeError("Steampipe service not initialized")
-            
-            # Run the benchmark
-            benchmark_name = self.aws_config['default_benchmark']
-            logger.info(f"Running AWS benchmark: {benchmark_name}")
-            
-            results = await self.steampipe_service.run_benchmark(
-                benchmark_name=benchmark_name,
-                timeout=300
-            )
-            
-            if not results:
-                logger.warning("No benchmark results returned")
-                return {}
-            
-            logger.info(f"AWS benchmark scan completed")
-            return results
-            
-        except Exception as e:
-            logger.error(f"AWS compliance check failed: {str(e)}")
-            raise
-    
-    def _process_benchmark_results(self, results: Dict, account_id: str) -> Dict[str, Any]:
-        """Process AWS benchmark results into standardized format"""
-        try:
-            findings = []
-            category_counts = {}
-            severity_counts = {"INFO": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 0, "CRITICAL": 0}
-            status_counts = {"alarm": 0, "ok": 0, "info": 0, "skip": 0}
-            
-            # Extract controls from benchmark results
-            if 'groups' in results:
-                for group in results['groups']:
-                    self._process_group(group, findings, category_counts, severity_counts, status_counts, account_id)
-            
-            # Calculate stats
-            stats = {
-                'total_findings': len(findings),
-                'failed_findings': status_counts.get('alarm', 0),
-                'pass_findings': status_counts.get('ok', 0),
-                'warning_findings': status_counts.get('info', 0),
-                'skip_findings': status_counts.get('skip', 0),
-                'severity_counts': severity_counts,
-                'category_counts': category_counts,
-                'status_counts': status_counts,
-                'account_id': account_id
-            }
-            
-            metadata = {
-                'scan_time': datetime.now().isoformat(),
-                'account_id': account_id,
-                'cloud_provider': 'aws',
-                'benchmark': 'AWS CIS Benchmark',
-                'total_controls_evaluated': len(findings)
-            }
-            
-            return {
-                'findings': findings,
-                'stats': stats,
-                'metadata': metadata
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing benchmark results: {str(e)}")
-            raise
-    
-    def _process_group(self, group, findings, category_counts, severity_counts, status_counts, account_id):
-        """Recursively process benchmark groups and controls"""
-        # Process controls in this group
-        if 'controls' in group and group['controls'] is not None:
-            for control in group['controls']:
-                finding = self._process_control(control, account_id)
-                if finding:
-                    findings.append(finding)
-                    
-                    # Update counts
-                    category = finding.get('category', 'Unknown')
-                    category_counts[category] = category_counts.get(category, 0) + 1
-                    
-                    severity = finding.get('severity', 'INFO')
-                    severity_counts[severity] = severity_counts.get(severity, 0) + 1
-                    
-                    status = finding.get('status', 'unknown').lower()
-                    status_counts[status] = status_counts.get(status, 0) + 1
-        
-        # Recursively process child groups
-        if 'groups' in group and group['groups'] is not None:
-            for child_group in group['groups']:
-                self._process_group(child_group, findings, category_counts, severity_counts, status_counts, account_id)
-    
-    def _process_control(self, control, account_id) -> Optional[Dict]:
-        """Process a single control into a finding"""
-        try:
-            # Debug: Log first control to see structure
-            if not hasattr(self, '_logged_control_structure'):
-                logger.debug(f"Sample control structure: {json.dumps(control, indent=2, default=str)[:500]}")
-                self._logged_control_structure = True
-            
-            control_id = control.get('control_id', 'unknown')
-            title = control.get('title', 'Unknown Control')
-            description = control.get('description', '')
-            
-            # Extract status from multiple possible locations
-            status = 'unknown'
-            if 'status' in control:
-                status = control['status']
-            elif 'summary' in control and control['summary'] is not None:
-                if isinstance(control['summary'], dict):
-                    status = control['summary'].get('status', 'unknown')
-                else:
-                    status = control['summary']
-            
-            # Also check results array for status
-            if status == 'unknown' and 'results' in control and control['results']:
-                # Get the most common status from results
-                from collections import Counter
-                statuses = [r.get('status', 'unknown') for r in control['results'] if isinstance(r, dict)]
-                if statuses:
-                    status = Counter(statuses).most_common(1)[0][0]
-            
-            # Map Steampipe status to our status
-            status_map = {
-                'alarm': 'alarm',
-                'error': 'alarm',
-                'ok': 'ok',
-                'info': 'info',
-                'skip': 'skip'
-            }
-            
-            mapped_status = status_map.get(status.lower() if isinstance(status, str) else 'unknown', 'unknown')
-            
-            # Extract severity from control metadata or determine based on status and control type
-            severity = control.get('severity', 'MEDIUM').upper()
-            
-            # If severity not in control, determine based on status and control type
-            if severity not in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']:
-                if mapped_status == 'alarm':
-                    # High severity for IAM, root, encryption, and public access issues
-                    if any(keyword in control_id.lower() for keyword in ['iam', 'root', 'mfa', 'password']):
-                        severity = 'HIGH'
-                    elif any(keyword in control_id.lower() for keyword in ['encryption', 'kms', 'public', 'exposed']):
-                        severity = 'HIGH'
-                    elif any(keyword in control_id.lower() for keyword in ['logging', 'monitoring', 'cloudtrail']):
-                        severity = 'MEDIUM'
+            # Return the validation result
+            # Convert AWS-specific format to unified API format if needed
+            if isinstance(result, dict):
+                # Handle AWS-specific format: {'valid': bool} -> {'success': bool}
+                if 'valid' in result and 'success' not in result:
+                    if result['valid']:
+                        return jsonify({
+                            'success': True,
+                            'data': {
+                                'account_id': result.get('account_id'),
+                                'caller_identity': result.get('caller_identity'),
+                                'assumed_role': result.get('assumed_role')
+                            }
+                        }), 200
                     else:
-                        severity = 'MEDIUM'
-                elif mapped_status == 'ok':
-                    severity = 'INFO'
-                elif mapped_status == 'info':
-                    severity = 'LOW'
-                else:
-                    severity = 'MEDIUM'
-            
-            # Extract category from control ID
-            category = 'Security'
-            if 'iam' in control_id.lower():
-                category = 'Identity and Access Management'
-            elif 's3' in control_id.lower():
-                category = 'Storage'
-            elif 'ec2' in control_id.lower():
-                category = 'Compute'
-            elif 'vpc' in control_id.lower():
-                category = 'Network'
-            
-            finding = {
-                'id': f"aws-{account_id}-{control_id}",
-                'control_id': control_id,
-                'control': title,
-                'category': category,
-                'severity': severity,
-                'status': mapped_status,
-                'reason': description or title,
-                'details': description,
-                'account_id': account_id,
-                'resource_id': account_id,
-                'cloud_provider': 'aws'
-            }
-            
-            return finding
+                        return jsonify({
+                            'success': False,
+                            'error': {
+                                'message': 'Credential validation failed',
+                                'code': 'INVALID_CREDENTIALS',
+                                'details': ', '.join(result.get('errors', []))
+                            }
+                        }), 400
+                
+                # Standard unified API format
+                status_code = 200 if result.get('success') else 400
+                return jsonify(result), status_code
+            else:
+                # Fallback for non-standard return format
+                return jsonify({
+                    'success': True,
+                    'provider': provider,
+                    'data': result
+                }), 200
             
         except Exception as e:
-            logger.warning(f"Error processing control: {str(e)}")
-            return None
-    
-    async def _collect_config_data(self) -> Dict[str, Any]:
-        """Collect AWS configuration data for RAG analysis"""
-        if not self.steampipe_service:
-            return {}
-        
-        aws_queries = {
-            'iam_users': 'SELECT name, arn, create_date FROM aws_iam_user',
-            'iam_roles': 'SELECT name, arn, create_date FROM aws_iam_role LIMIT 10',
-            's3_buckets': 'SELECT name, region, creation_date FROM aws_s3_bucket',
-            'ec2_instances': 'SELECT instance_id, instance_type, instance_state, region FROM aws_ec2_instance',
-            'vpcs': 'SELECT vpc_id, cidr_block, is_default, region FROM aws_vpc',
-            'security_groups': 'SELECT group_id, group_name, vpc_id, region FROM aws_vpc_security_group LIMIT 20'
-        }
-        
-        return await self.steampipe_service.collect_config_data(aws_queries)
-
-
-# ============================================================================
-# Handler Functions for Provider Registry
-# ============================================================================
-
-async def scan_aws_account_handler(
-    user_id: str,
-    account_id: str,
-    credentials: Dict[str, str],
-    db_session,
-    scan_record,
-    **kwargs
-) -> Dict[str, Any]:
-    """
-    Handler function for AWS account scanning - used by UnifiedCloudAPI
-    
-    Args:
-        user_id: User identifier
-        account_id: AWS account ID
-        credentials: AWS credentials (can include role_arn for role assumption)
-        db_session: SQLAlchemy session
-        scan_record: CloudScan database record
-        **kwargs: Additional parameters (cloudname, scan_id, etc.)
-    
-    Returns:
-        Dict with scan results
-    """
-    try:
-        logger.info(f"AWS scan handler called for {user_id}:{account_id}")
-        
-        # Create scanner instance
-        async with AwsSecurityScanner(db_session, scan_record) as scanner:
-            # Extract optional parameters
-            scan_id = kwargs.get('scan_id')
-            cloudname = kwargs.get('cloudname')
-            
-            # Run the scan using base class method
-            results = await scanner.scan_account(
-                user_id=user_id,
-                account_id=account_id,
-                credentials=credentials,
-                scan_id=scan_id,
-                cloudname=cloudname
-            )
-            
-            return results
-            
-    except Exception as e:
-        logger.error(f"AWS scan handler error: {str(e)}", exc_info=True)
-        return {
-            'success': False,
-            'error': {
-                'message': str(e),
-                'code': 'AWS_SCAN_ERROR',
-                'type': type(e).__name__
-            }
-        }
-
-
-async def validate_aws_credentials(
-    credentials: Dict[str, str] = None, 
-    account_id: str = None,
-    role_arn: str = None,
-    external_id: str = None,
-    session_name: str = None
-) -> Dict[str, Any]:
-    """
-    Validate AWS credentials - wrapper for UnifiedCloudAPI
-    
-    Args:
-        credentials: AWS credentials dict (optional if using role_arn)
-        account_id: Optional expected account ID
-        role_arn: Optional IAM role ARN for cross-account access
-        external_id: Optional external ID for role assumption
-        session_name: Optional session name for assumed role
-    
-    Returns:
-        Dict with success status and validation results
-    """
-    validator = AwsCredentialValidator()
-    
-    # Default credentials to empty dict if not provided
-    if credentials is None:
-        credentials = {}
-    
-    # Check if role assumption is needed
-    if role_arn:
-        # Use app's own credentials for role assumption
-        base_creds = {
-            'aws_access_key_id': os.getenv('AWS_ACCESS_KEY_ID'),
-            'aws_secret_access_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
-            'aws_session_token': os.getenv('AWS_SESSION_TOKEN')
-        }
-        
-        # If credentials were provided, use those instead of env vars
-        if credentials.get('aws_access_key_id'):
-            base_creds = credentials
-        
-        role_config = {
-            'role_arn': role_arn,
-            'external_id': external_id,
-            'session_name': session_name or f'SecurityScan-{int(time.time())}'
-        }
-        
-        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'role_assumption'
-                }
-            }
-        else:
-            return {
+            logger.error(f"Error validating credentials: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
                 'success': False,
                 'error': {
-                    'message': 'Role assumption failed',
-                    'code': 'INVALID_ROLE',
-                    'details': ', '.join(result.get('errors', []))
+                    'message': 'Internal server error during credential validation',
+                    'code': 'VALIDATION_ERROR',
+                    'details': str(e)
                 }
-            }
+            }), 500
     
-    # Legacy path: check if role info is inside credentials dict
-    elif 'role_arn' in credentials:
-        base_creds = {
-            'aws_access_key_id': credentials.get('aws_access_key_id'),
-            'aws_secret_access_key': credentials.get('aws_secret_access_key'),
-            'aws_session_token': credentials.get('aws_session_token')
-        }
-        
-        role_config = {
-            'role_arn': credentials['role_arn'],
-            'external_id': credentials.get('external_id'),
-            'session_name': credentials.get('session_name', f'SecurityScan-{int(time.time())}')
-        }
-        
-        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'role_assumption'
-                }
-            }
-        else:
-            return {
-                'success': False,
-                'error': {
-                    'message': 'Role assumption failed',
-                    'code': 'INVALID_ROLE',
-                    'details': ', '.join(result.get('errors', []))
-                }
-            }
-    
-    # Direct credentials validation
-    else:
-        result = await validator.validate_credentials(credentials, account_id)
-        
-        # Convert to unified API format
-        if result.get('valid'):
-            return {
-                'success': True,
-                'data': {
-                    'account_id': result.get('account_id'),
-                    'caller_identity': result.get('caller_identity'),
-                    'method': 'direct_credentials'
-                }
-            }
-        else:
-            return {
-                'success': False,
-                'error': {
-                    'message': 'Invalid credentials',
-                    'code': 'INVALID_CREDENTIALS',
-                    'details': ', '.join(result.get('errors', []))
-                }
-            }
+    def get_blueprint(self):
+        """Get the Flask blueprint"""
+        return self.blueprint
