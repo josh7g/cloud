@@ -440,10 +440,32 @@ class AwsSecurityScanner(BaseCloudScanner):
     def _process_control(self, control, account_id) -> Optional[Dict]:
         """Process a single control into a finding"""
         try:
+            # Debug: Log first control to see structure
+            if not hasattr(self, '_logged_control_structure'):
+                logger.debug(f"Sample control structure: {json.dumps(control, indent=2, default=str)[:500]}")
+                self._logged_control_structure = True
+            
             control_id = control.get('control_id', 'unknown')
             title = control.get('title', 'Unknown Control')
             description = control.get('description', '')
-            status = control.get('summary', {}).get('status', 'unknown')
+            
+            # Extract status from multiple possible locations
+            status = 'unknown'
+            if 'status' in control:
+                status = control['status']
+            elif 'summary' in control and control['summary'] is not None:
+                if isinstance(control['summary'], dict):
+                    status = control['summary'].get('status', 'unknown')
+                else:
+                    status = control['summary']
+            
+            # Also check results array for status
+            if status == 'unknown' and 'results' in control and control['results']:
+                # Get the most common status from results
+                from collections import Counter
+                statuses = [r.get('status', 'unknown') for r in control['results'] if isinstance(r, dict)]
+                if statuses:
+                    status = Counter(statuses).most_common(1)[0][0]
             
             # Map Steampipe status to our status
             status_map = {
@@ -454,19 +476,29 @@ class AwsSecurityScanner(BaseCloudScanner):
                 'skip': 'skip'
             }
             
-            mapped_status = status_map.get(status, 'unknown')
+            mapped_status = status_map.get(status.lower() if isinstance(status, str) else 'unknown', 'unknown')
             
-            # Determine severity based on status and control type
-            severity = 'MEDIUM'
-            if mapped_status == 'alarm':
-                if 'iam' in control_id.lower() or 'root' in control_id.lower():
-                    severity = 'HIGH'
-                elif 'encryption' in control_id.lower() or 'public' in control_id.lower():
-                    severity = 'HIGH'
+            # Extract severity from control metadata or determine based on status and control type
+            severity = control.get('severity', 'MEDIUM').upper()
+            
+            # If severity not in control, determine based on status and control type
+            if severity not in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']:
+                if mapped_status == 'alarm':
+                    # High severity for IAM, root, encryption, and public access issues
+                    if any(keyword in control_id.lower() for keyword in ['iam', 'root', 'mfa', 'password']):
+                        severity = 'HIGH'
+                    elif any(keyword in control_id.lower() for keyword in ['encryption', 'kms', 'public', 'exposed']):
+                        severity = 'HIGH'
+                    elif any(keyword in control_id.lower() for keyword in ['logging', 'monitoring', 'cloudtrail']):
+                        severity = 'MEDIUM'
+                    else:
+                        severity = 'MEDIUM'
+                elif mapped_status == 'ok':
+                    severity = 'INFO'
+                elif mapped_status == 'info':
+                    severity = 'LOW'
                 else:
                     severity = 'MEDIUM'
-            elif mapped_status == 'ok':
-                severity = 'INFO'
             
             # Extract category from control ID
             category = 'Security'
@@ -574,21 +606,75 @@ async def scan_aws_account_handler(
         }
 
 
-async def validate_aws_credentials(credentials: Dict[str, str], account_id: str = None) -> Dict[str, Any]:
+async def validate_aws_credentials(
+    credentials: Dict[str, str] = None, 
+    account_id: str = None,
+    role_arn: str = None,
+    external_id: str = None,
+    session_name: str = None
+) -> Dict[str, Any]:
     """
     Validate AWS credentials - wrapper for UnifiedCloudAPI
     
     Args:
-        credentials: AWS credentials dict
+        credentials: AWS credentials dict (optional if using role_arn)
         account_id: Optional expected account ID
+        role_arn: Optional IAM role ARN for cross-account access
+        external_id: Optional external ID for role assumption
+        session_name: Optional session name for assumed role
     
     Returns:
-        Dict with validation results
+        Dict with success status and validation results
     """
     validator = AwsCredentialValidator()
     
+    # Default credentials to empty dict if not provided
+    if credentials is None:
+        credentials = {}
+    
     # Check if role assumption is needed
-    if 'role_arn' in credentials:
+    if role_arn:
+        # Use app's own credentials for role assumption
+        base_creds = {
+            'aws_access_key_id': os.getenv('AWS_ACCESS_KEY_ID'),
+            'aws_secret_access_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
+            'aws_session_token': os.getenv('AWS_SESSION_TOKEN')
+        }
+        
+        # If credentials were provided, use those instead of env vars
+        if credentials.get('aws_access_key_id'):
+            base_creds = credentials
+        
+        role_config = {
+            'role_arn': role_arn,
+            'external_id': external_id,
+            'session_name': session_name or f'SecurityScan-{int(time.time())}'
+        }
+        
+        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
+        
+        # Convert to unified API format
+        if result.get('valid'):
+            return {
+                'success': True,
+                'data': {
+                    'account_id': result.get('account_id'),
+                    'caller_identity': result.get('caller_identity'),
+                    'method': 'role_assumption'
+                }
+            }
+        else:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Role assumption failed',
+                    'code': 'INVALID_ROLE',
+                    'details': ', '.join(result.get('errors', []))
+                }
+            }
+    
+    # Legacy path: check if role info is inside credentials dict
+    elif 'role_arn' in credentials:
         base_creds = {
             'aws_access_key_id': credentials.get('aws_access_key_id'),
             'aws_secret_access_key': credentials.get('aws_secret_access_key'),
@@ -601,6 +687,48 @@ async def validate_aws_credentials(credentials: Dict[str, str], account_id: str 
             'session_name': credentials.get('session_name', f'SecurityScan-{int(time.time())}')
         }
         
-        return await validator.validate_credentials_with_role(base_creds, account_id, role_config)
+        result = await validator.validate_credentials_with_role(base_creds, account_id, role_config)
+        
+        # Convert to unified API format
+        if result.get('valid'):
+            return {
+                'success': True,
+                'data': {
+                    'account_id': result.get('account_id'),
+                    'caller_identity': result.get('caller_identity'),
+                    'method': 'role_assumption'
+                }
+            }
+        else:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Role assumption failed',
+                    'code': 'INVALID_ROLE',
+                    'details': ', '.join(result.get('errors', []))
+                }
+            }
+    
+    # Direct credentials validation
     else:
-        return await validator.validate_credentials(credentials, account_id)
+        result = await validator.validate_credentials(credentials, account_id)
+        
+        # Convert to unified API format
+        if result.get('valid'):
+            return {
+                'success': True,
+                'data': {
+                    'account_id': result.get('account_id'),
+                    'caller_identity': result.get('caller_identity'),
+                    'method': 'direct_credentials'
+                }
+            }
+        else:
+            return {
+                'success': False,
+                'error': {
+                    'message': 'Invalid credentials',
+                    'code': 'INVALID_CREDENTIALS',
+                    'details': ', '.join(result.get('errors', []))
+                }
+            }
