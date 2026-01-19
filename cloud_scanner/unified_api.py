@@ -178,11 +178,11 @@ class UnifiedCloudAPI:
             logger.debug(f"Extracted workspace_id from query params: {workspace_id}")
             return str(workspace_id).strip()
         
-        logger.debug("No workspace_id found in headers, body, or query params")
+        logger.debug("No workspace_id found in request")
         return None
     
     def _handle_scan_request(self):
-        """Handle scan request - provider specified in request body"""
+        """Handle cloud scan request - delegates to provider-specific handler"""
         try:
             data = request.get_json() or {}
             provider = self._get_provider_from_request()
@@ -192,329 +192,45 @@ class UnifiedCloudAPI:
                     'error': 'Missing required field: provider or cloud_provider'
                 }), 400
             
+            # Check if provider is registered
             if not self.registry.is_provider_registered(provider):
                 return jsonify({
-                    'error': f'Provider {provider} is not registered'
+                    'error': f'Provider {provider} is not registered',
+                    'available_providers': self.registry.list_providers()
                 }), 400
             
-            user_id = data.get('user_id')
-            account_id = data.get('account_id')
-            credentials = data.get('credentials', {})
-            cloudname = data.get('cloudname')
-            worksheet_number = data.get('worksheet_number', 1)
-            provider_specific = data.get('provider_specific', {})
-            
-            # Extract workspace_id from headers or body
-            workspace_id = self._get_workspace_id_from_request()
-            logger.info(f"Cloud scan request - user_id: {user_id}, workspace_id: {workspace_id}, provider: {provider}")
-            
-            # Extract role_config from provider_specific if present
-            role_config = provider_specific.get('role_config') if provider_specific else None
-            
-            # Validate required fields
-            # For IAM role scanning, credentials can be empty if role_config is provided
-            if not user_id or not account_id:
+            # Get the scan handler for this provider
+            scan_handler = self.registry.get_scan_handler(provider)
+            if not scan_handler:
                 return jsonify({
-                    'error': 'Missing required fields: user_id, account_id'
-                }), 400
-            
-            # Credentials are required unless using IAM role assumption
-            if not credentials and not role_config:
-                return jsonify({
-                    'error': 'Missing required fields: credentials or role_config must be provided'
-                }), 400
-            
-            # Get provider-specific handler
-            handler = self.registry.get_scan_handler(provider)
-            if not handler:
-                return jsonify({
-                    'error': f'No scan handler registered for {provider}'
+                    'error': f'Scan handler not found for provider {provider}'
                 }), 500
             
-            # Create scan record
-            engine = create_db_engine()
-            session = Session(engine)
-            
-            try:
-                scan_record = CloudScan(
-                    user_id=user_id,
-                    cloud_provider=provider,
-                    account_id=account_id,
-                    cloudname=cloudname,
-                    worksheet_number=worksheet_number,
-                    status='queued',
-                    workspace_id=workspace_id  # Associate scan with workspace
-                )
-                session.add(scan_record)
-                session.commit()
-                logger.info(f"Created cloud scan record - scan_id: {scan_record.id}, workspace_id: {workspace_id}, user_id: {user_id}, provider: {provider}")
-                
-                # Run scan in background
-                import threading
-                import asyncio
-                
-                def run_async_scan():
-                    """Run async scan handler in new event loop"""
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        # Prepare handler arguments
-                        handler_kwargs = {
-                            'user_id': user_id,
-                            'account_id': account_id,
-                            'credentials': credentials,
-                            'db_session': session,
-                            'scan_record': scan_record,
-                            'cloudname': cloudname,
-                        }
-                        
-                        # Add role_config if present
-                        if role_config:
-                            handler_kwargs['role_config'] = role_config
-                        
-                        # Add any other provider_specific fields (excluding role_config which we already handled)
-                        if provider_specific:
-                            for key, value in provider_specific.items():
-                                if key != 'role_config' and key not in handler_kwargs:
-                                    handler_kwargs[key] = value
-                        
-                        # Run the async handler
-                        result = loop.run_until_complete(handler(**handler_kwargs))
-                        logger.info(f"Scan completed: {result}")
-                    except Exception as e:
-                        logger.error(f"Error in async scan handler: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        # Update scan record to failed status
-                        try:
-                            scan_record.status = 'failed'
-                            session.commit()
-                        except:
-                            session.rollback()
-                    finally:
-                        loop.close()
-                        session.close()
-                        engine.dispose()
-                
-                scan_thread = threading.Thread(target=run_async_scan, daemon=True)
-                scan_thread.start()
-                
-                return jsonify({
-                    'success': True,
-                    'scan_id': scan_record.id,
-                    'provider': provider,
-                    'message': f'{provider.upper()} scan started'
-                }), 202
-                
-            except Exception as e:
-                session.rollback()
-                logger.error(f"Error creating scan record: {str(e)}")
-                return jsonify({
-                    'error': f'Failed to start scan: {str(e)}'
-                }), 500
-            finally:
-                session.close()
-                engine.dispose()
-                
-        except Exception as e:
-            logger.error(f"Error in scan request: {str(e)}")
-            return jsonify({
-                'error': f'Internal server error: {str(e)}'
-            }), 500
-    
-    def _handle_list_scans(self, user_id: str):
-        """List all scans for a user - optionally filter by provider and workspace"""
-        engine = None
-        db_session = None
-        try:
-            provider = self._get_provider_from_request()
+            # Extract workspace_id from request
             workspace_id = self._get_workspace_id_from_request()
+            if workspace_id:
+                data['workspace_id'] = workspace_id
+                logger.info(f"Including workspace_id in scan request: {workspace_id}")
             
-            # Get query parameters with defaults
-            page = max(1, int(request.args.get('page', 1)))
-            per_page = min(100, max(1, int(request.args.get('limit', 30))))
-            sort_by = request.args.get('sort_by', 'created_at')
-            sort_order = request.args.get('sort_order', 'desc')
+            # Call the provider-specific scan handler
+            import asyncio
+            result = asyncio.run(scan_handler(data))
             
-            # Validate sort parameters
-            valid_sort_fields = ['created_at', 'account_id', 'status', 'completed_at', 'cloudname', 'worksheet_number']
-            if sort_by not in valid_sort_fields:
-                sort_by = 'created_at'
-                
-            valid_sort_orders = ['asc', 'desc']
-            if sort_order not in valid_sort_orders:
-                sort_order = 'desc'
+            return jsonify(result), 200
             
-            engine = create_db_engine()
-            SessionFactory = sessionmaker(bind=engine)
-            db_session = SessionFactory()
-            
-            try:
-                # Build query
-                query = db_session.query(CloudScan).filter(CloudScan.user_id == user_id)
-                
-                # Filter by workspace_id if provided (workspace-based filtering)
-                if workspace_id:
-                    query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
-                
-                if provider:
-                    query = query.filter(CloudScan.cloud_provider == provider)
-                
-                # Apply sorting
-                if sort_order == 'asc':
-                    query = query.order_by(getattr(CloudScan, sort_by).asc())
-                else:
-                    query = query.order_by(getattr(CloudScan, sort_by).desc())
-                
-                # Count total scans
-                total_scans = query.count()
-                
-                # Apply pagination
-                scans = query.limit(per_page).offset((page - 1) * per_page).all()
-                
-                # Format response to match old AWS API format
-                scan_list = []
-                for scan in scans:
-                    findings = scan.findings or {}
-                    stats = findings.get('stats', {})
-                    
-                    # Calculate the correct total_findings 
-                    if 'failed_findings' in stats and 'pass_findings' in stats and 'warning_findings' in stats and 'skip_findings' in stats:
-                        total_findings = (
-                            stats.get('failed_findings', 0) + 
-                            stats.get('pass_findings', 0) + 
-                            stats.get('warning_findings', 0) + 
-                            stats.get('skip_findings', 0)
-                        )
-                        # Update the total_findings to the correct sum
-                        stats['total_findings'] = total_findings
-                    
-                    scan_data = {
-                        'id': scan.id,
-                        'account_id': scan.account_id,
-                        'cloud_provider': scan.cloud_provider,
-                        'cloudname': scan.cloudname,
-                        'worksheet_number': scan.worksheet_number,
-                        'status': scan.status,
-                        'created_at': scan.created_at.isoformat() if scan.created_at else None,
-                        'completed_at': scan.completed_at.isoformat() if scan.completed_at else None,
-                        'summary': {
-                            'total_findings': stats.get('total_findings', 0),
-                            'failed_findings': stats.get('failed_findings', 0),
-                            'warning_findings': stats.get('warning_findings', 0),
-                            'pass_findings': stats.get('pass_findings', 0),
-                            'severity_counts': stats.get('severity_counts', {})
-                        } if stats else None,
-                        'error': scan.error
-                    }
-                    
-                    scan_list.append(scan_data)
-                
-                # Build pagination info
-                total_pages = (total_scans + per_page - 1) // per_page if total_scans > 0 else 1
-                
-                pagination = {
-                    'current_page': page,
-                    'per_page': per_page,
-                    'total_items': total_scans,
-                    'total_pages': total_pages,
-                    'has_next': page < total_pages,
-                    'has_prev': page > 1
-                }
-                
-                # Determine benchmark name based on provider
-                benchmark_map = {
-                    'aws': 'CIS AWS Foundations Benchmark v1.4',
-                    'azure': 'CIS Microsoft Azure Foundations Benchmark',
-                    'gcp': 'CIS Google Cloud Platform Foundations Benchmark'
-                }
-                benchmark = benchmark_map.get(provider or 'aws', 'CIS Cloud Security Benchmark')
-                
-                return jsonify({
-                    'success': True,
-                    'data': {
-                        'scans': scan_list,
-                        'pagination': pagination,
-                        'user_id': user_id,
-                        'benchmark': benchmark
-                    }
-                }), 200
-                
-            finally:
-                if db_session:
-                    db_session.close()
-                if engine:
-                    engine.dispose()
-                
         except Exception as e:
-            logger.error(f"Error listing scans: {str(e)}", exc_info=True)
-            return jsonify({
-                'success': False,
-                'error': {
-                    'message': 'Internal server error',
-                    'code': 'INTERNAL_ERROR',
-                    'details': str(e)
-                }
-            }), 500
-    
-    def _handle_get_user_scans(self, user_id: str):
-        """Get user scans with filtering by provider, status, and workspace"""
-        try:
-            provider = self._get_provider_from_request()
-            workspace_id = self._get_workspace_id_from_request()
-            status = request.args.get('status')
-            limit = request.args.get('limit', type=int, default=10)
-            
-            engine = create_db_engine()
-            session = Session(engine)
-            
-            try:
-                query = session.query(CloudScan).filter(CloudScan.user_id == user_id)
-                
-                # Filter by workspace_id if provided (workspace-based filtering)
-                if workspace_id:
-                    query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
-                
-                if provider:
-                    query = query.filter(CloudScan.cloud_provider == provider)
-                if status:
-                    query = query.filter(CloudScan.status == status)
-                
-                scans = query.order_by(CloudScan.created_at.desc()).limit(limit).all()
-                
-                return jsonify({
-                    'scans': [scan.to_dict() for scan in scans],
-                    'count': len(scans),
-                    'provider': provider or 'all',
-                    'workspace_id': workspace_id
-                }), 200
-                
-            finally:
-                session.close()
-                engine.dispose()
-                
-        except Exception as e:
-            logger.error(f"Error getting user scans: {str(e)}")
+            logger.error(f"Error handling scan request: {str(e)}")
+            logger.error(traceback.format_exc())
             return jsonify({'error': str(e)}), 500
     
     def _handle_get_scan_result(self, scan_id: int):
-        """Get scan result by scan ID - verify workspace if provided"""
+        """Get scan result by scan ID"""
         try:
-            workspace_id = self._get_workspace_id_from_request()
-            
             engine = create_db_engine()
             session = Session(engine)
             
             try:
-                query = session.query(CloudScan).filter(CloudScan.id == scan_id)
-                
-                # If workspace_id is provided, ensure scan belongs to that workspace
-                if workspace_id:
-                    query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scan {scan_id} by workspace_id: {workspace_id}")
-                
-                scan = query.first()
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
                 
                 if not scan:
                     return jsonify({'error': 'Scan not found'}), 404
@@ -530,33 +246,23 @@ class UnifiedCloudAPI:
             return jsonify({'error': str(e)}), 500
     
     def _handle_get_reranked_by_scan_id(self, scan_id: int):
-        """Get reranked findings by scan ID - verify workspace if provided"""
+        """Get reranked findings by scan ID"""
         try:
-            workspace_id = self._get_workspace_id_from_request()
-            
             engine = create_db_engine()
             session = Session(engine)
             
             try:
-                query = session.query(CloudScan).filter(CloudScan.id == scan_id)
-                
-                # If workspace_id is provided, ensure scan belongs to that workspace
-                if workspace_id:
-                    query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scan {scan_id} by workspace_id: {workspace_id}")
-                
-                scan = query.first()
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
                 
                 if not scan:
                     return jsonify({'error': 'Scan not found'}), 404
                 
                 if not scan.rerank:
-                    return jsonify({'error': 'Reranked findings not available'}), 404
+                    return jsonify({'error': 'No reranked findings available'}), 404
                 
                 return jsonify({
-                    'reranked_findings': scan.rerank,
                     'scan_id': scan.id,
-                    'provider': scan.cloud_provider
+                    'reranked_findings': scan.rerank
                 }), 200
                 
             finally:
@@ -568,22 +274,13 @@ class UnifiedCloudAPI:
             return jsonify({'error': str(e)}), 500
     
     def _handle_delete_scan(self, scan_id: int):
-        """Delete a scan - verify workspace if provided"""
+        """Delete a scan"""
         try:
-            workspace_id = self._get_workspace_id_from_request()
-            
             engine = create_db_engine()
             session = Session(engine)
             
             try:
-                query = session.query(CloudScan).filter(CloudScan.id == scan_id)
-                
-                # If workspace_id is provided, ensure scan belongs to that workspace
-                if workspace_id:
-                    query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Verifying scan {scan_id} belongs to workspace_id: {workspace_id}")
-                
-                scan = query.first()
+                scan = session.query(CloudScan).filter(CloudScan.id == scan_id).first()
                 
                 if not scan:
                     return jsonify({'error': 'Scan not found'}), 404
@@ -591,7 +288,7 @@ class UnifiedCloudAPI:
                 session.delete(scan)
                 session.commit()
                 
-                return jsonify({'success': True, 'message': 'Scan deleted'}), 200
+                return jsonify({'message': 'Scan deleted successfully'}), 200
                 
             finally:
                 session.close()
@@ -599,6 +296,88 @@ class UnifiedCloudAPI:
                 
         except Exception as e:
             logger.error(f"Error deleting scan: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_list_scans(self, user_id: str):
+        """List all scans for a user - optionally filter by provider and workspace"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(CloudScan.user_id == user_id)
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                scans = query.order_by(CloudScan.created_at.desc()).all()
+                
+                return jsonify({
+                    'scans': [scan.to_dict() for scan in scans],
+                    'count': len(scans),
+                    'provider': provider or 'all',
+                    'workspace_id': workspace_id
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error listing scans: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+    
+    def _handle_get_user_scans(self, user_id: str):
+        """Get user scans with filtering"""
+        try:
+            provider = self._get_provider_from_request()
+            workspace_id = self._get_workspace_id_from_request()
+            status = request.args.get('status')
+            limit = request.args.get('limit', type=int, default=50)
+            
+            engine = create_db_engine()
+            session = Session(engine)
+            
+            try:
+                query = session.query(CloudScan).filter(CloudScan.user_id == user_id)
+                
+                # Filter by workspace_id if provided
+                if workspace_id:
+                    query = query.filter(CloudScan.workspace_id == workspace_id)
+                    logger.info(f"Filtering scans by workspace_id: {workspace_id}")
+                
+                if provider:
+                    query = query.filter(CloudScan.cloud_provider == provider)
+                
+                if status:
+                    query = query.filter(CloudScan.status == status)
+                
+                scans = query.order_by(CloudScan.created_at.desc()).limit(limit).all()
+                
+                return jsonify({
+                    'scans': [scan.to_dict() for scan in scans],
+                    'count': len(scans),
+                    'filters': {
+                        'provider': provider or 'all',
+                        'status': status or 'all',
+                        'workspace_id': workspace_id
+                    }
+                }), 200
+                
+            finally:
+                session.close()
+                engine.dispose()
+                
+        except Exception as e:
+            logger.error(f"Error getting user scans: {str(e)}")
             return jsonify({'error': str(e)}), 500
     
     def _handle_get_scan_result_by_cloudname(self, user_id: str, cloudname: str):
@@ -636,7 +415,7 @@ class UnifiedCloudAPI:
                 engine.dispose()
                 
         except Exception as e:
-            logger.error(f"Error getting scan result by cloudname: {str(e)}")
+            logger.error(f"Error getting scan result: {str(e)}")
             return jsonify({'error': str(e)}), 500
     
     def _handle_get_reranked_by_cloudname(self, user_id: str, cloudname: str):
@@ -657,7 +436,7 @@ class UnifiedCloudAPI:
                 # Filter by workspace_id if provided
                 if workspace_id:
                     query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scan by workspace_id: {workspace_id}")
+                    logger.info(f"Filtering reranked findings by workspace_id: {workspace_id}")
                 
                 if provider:
                     query = query.filter(CloudScan.cloud_provider == provider)
@@ -668,12 +447,13 @@ class UnifiedCloudAPI:
                     return jsonify({'error': 'Scan not found'}), 404
                 
                 if not scan.rerank:
-                    return jsonify({'error': 'Reranked findings not available'}), 404
+                    return jsonify({'error': 'No reranked findings available'}), 404
                 
                 return jsonify({
-                    'reranked_findings': scan.rerank,
                     'scan_id': scan.id,
-                    'provider': scan.cloud_provider
+                    'cloudname': cloudname,
+                    'reranked_findings': scan.rerank,
+                    'workspace_id': workspace_id
                 }), 200
                 
             finally:
@@ -708,7 +488,7 @@ class UnifiedCloudAPI:
                 # Filter by workspace_id if provided
                 if workspace_id:
                     query = query.filter(CloudScan.workspace_id == workspace_id)
-                    logger.info(f"Filtering scan by workspace_id: {workspace_id}")
+                    logger.info(f"Filtering reranked findings by workspace_id: {workspace_id}")
                 
                 if provider:
                     query = query.filter(CloudScan.cloud_provider == provider)
@@ -719,13 +499,14 @@ class UnifiedCloudAPI:
                     return jsonify({'error': 'Scan not found'}), 404
                 
                 if not scan.rerank:
-                    return jsonify({'error': 'Reranked findings not available'}), 404
+                    return jsonify({'error': 'No reranked findings available'}), 404
                 
                 return jsonify({
-                    'reranked_findings': scan.rerank,
                     'scan_id': scan.id,
+                    'cloudname': cloudname,
                     'worksheet_number': worksheet_number,
-                    'provider': scan.cloud_provider
+                    'reranked_findings': scan.rerank,
+                    'workspace_id': workspace_id
                 }), 200
                 
             finally:
@@ -881,43 +662,109 @@ class UnifiedCloudAPI:
             return jsonify({'error': str(e)}), 500
     
     def _handle_validate_credentials(self):
-        """Validate credentials - provider specified in request"""
+        """
+        Validate credentials for any cloud provider.
+        Request body should include:
+        - provider: Cloud provider name (aws, azure, gcp, etc.)
+        - credentials: Provider-specific credentials dict
+        - account_id (optional): Account/subscription/project ID
+        """
         try:
             data = request.get_json() or {}
             provider = self._get_provider_from_request()
             
             if not provider:
                 return jsonify({
-                    'error': 'Missing required field: provider or cloud_provider'
+                    'success': False,
+                    'error': {
+                        'message': 'Missing required field: provider or cloud_provider',
+                        'code': 'MISSING_PROVIDER'
+                    }
                 }), 400
             
+            # Check if provider is registered
             if not self.registry.is_provider_registered(provider):
                 return jsonify({
-                    'error': f'Provider {provider} is not registered'
+                    'success': False,
+                    'error': {
+                        'message': f'Provider {provider} is not registered',
+                        'code': 'INVALID_PROVIDER',
+                        'available_providers': self.registry.list_providers()
+                    }
                 }), 400
             
+            # Get validator for this provider
             validator = self.registry.get_validator(provider)
             if not validator:
                 return jsonify({
-                    'error': f'Credential validation not implemented for {provider}'
+                    'success': False,
+                    'error': {
+                        'message': f'Credential validation not implemented for {provider}',
+                        'code': 'VALIDATOR_NOT_FOUND'
+                    }
                 }), 501
             
+            # Extract credentials from request
             credentials = data.get('credentials', {})
+            
+            # Optional account/subscription/project ID
             account_id = data.get('account_id')
+            role_arn = data.get('role_arn')  # For AWS role assumption
+            external_id = data.get('external_id')  # For AWS external ID
             
-            if not credentials:
-                return jsonify({'error': 'Missing credentials'}), 400
+            # Validate that we have either credentials OR role_arn (for AWS)
+            if not credentials and not role_arn:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Must provide either credentials or role_arn for validation',
+                        'code': 'MISSING_CREDENTIALS'
+                    }
+                }), 400
             
+            # Call the provider-specific validator
             import asyncio
-            result = asyncio.run(validator(credentials, account_id))
             
-            return jsonify(result), 200
+            # Build validation kwargs based on provider
+            validation_kwargs = {
+                'credentials': credentials,
+                'account_id': account_id
+            }
+            
+            # Add provider-specific parameters
+            if provider == 'aws':
+                if role_arn:
+                    validation_kwargs['role_arn'] = role_arn
+                if external_id:
+                    validation_kwargs['external_id'] = external_id
+            
+            result = asyncio.run(validator(**validation_kwargs))
+            
+            # Return the validation result
+            # The validator should return a dict with 'success' and optionally 'error' or 'data'
+            if isinstance(result, dict):
+                status_code = 200 if result.get('success') else 400
+                return jsonify(result), status_code
+            else:
+                # Fallback for non-standard return format
+                return jsonify({
+                    'success': True,
+                    'provider': provider,
+                    'data': result
+                }), 200
             
         except Exception as e:
             logger.error(f"Error validating credentials: {str(e)}")
-            return jsonify({'error': str(e)}), 500
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': {
+                    'message': 'Internal server error during credential validation',
+                    'code': 'VALIDATION_ERROR',
+                    'details': str(e)
+                }
+            }), 500
     
     def get_blueprint(self):
         """Get the Flask blueprint"""
         return self.blueprint
-
