@@ -548,6 +548,11 @@ class AwsSecurityScanner(BaseCloudScanner):
         return await self.steampipe_service.collect_config_data(aws_queries)
 
 
+# ============================================================================
+# Handler Functions for Provider Registry
+# ============================================================================
+
+
 async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Handler function for AWS account scanning - used by UnifiedCloudAPI
@@ -657,28 +662,24 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
         scan_id = scan_record.id
         logger.info(f"Created scan record with ID: {scan_id}")
         
-        # Run scan in background
-        def run_scan_background():
-            """Run scan in background thread"""
-            import asyncio
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
+        # Run scan in background using asyncio task instead of thread
+        # This works better with gevent-patched environments
+        import asyncio
+        
+        async def run_scan_async():
+            """Run scan asynchronously"""
             try:
                 # Create scanner instance with context manager
-                async def run_scan():
-                    async with AwsSecurityScanner(db_session, scan_record) as scanner:
-                        # Run the scan
-                        await scanner.scan_account(
-                            user_id=user_id,
-                            account_id=account_id,
-                            credentials=credentials,
-                            scan_id=scan_id,
-                            cloudname=aws_cloudname
-                        )
+                async with AwsSecurityScanner(db_session, scan_record) as scanner:
+                    # Run the scan
+                    await scanner.scan_account(
+                        user_id=user_id,
+                        account_id=account_id,
+                        credentials=credentials,
+                        scan_id=scan_id,
+                        cloudname=aws_cloudname
+                    )
                 
-                loop.run_until_complete(run_scan())
                 logger.info(f"Scan {scan_id} completed successfully")
                 
             except Exception as e:
@@ -691,16 +692,14 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                 except Exception as commit_error:
                     logger.error(f"Failed to update scan record: {str(commit_error)}")
             finally:
-                loop.close()
                 try:
                     db_session.close()
                     engine.dispose()
                 except:
                     pass
         
-        # Start background thread
-        scan_thread = threading.Thread(target=run_scan_background, daemon=True)
-        scan_thread.start()
+        # Schedule the async task in the current event loop
+        asyncio.create_task(run_scan_async())
         
         # Return immediately with scan_id
         return {
