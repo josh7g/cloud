@@ -706,19 +706,21 @@ class UnifiedCloudAPI:
             
             # Extract credentials from request
             credentials = data.get('credentials', {})
-            if not credentials:
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'Missing credentials',
-                        'code': 'MISSING_CREDENTIALS'
-                    }
-                }), 400
             
             # Optional account/subscription/project ID
             account_id = data.get('account_id')
             role_arn = data.get('role_arn')  # For AWS role assumption
             external_id = data.get('external_id')  # For AWS external ID
+            
+            # Validate that we have either credentials OR role_arn (for AWS)
+            if not credentials and not role_arn:
+                return jsonify({
+                    'success': False,
+                    'error': {
+                        'message': 'Must provide either credentials or role_arn for validation',
+                        'code': 'MISSING_CREDENTIALS'
+                    }
+                }), 400
             
             # Call the provider-specific validator
             import asyncio
