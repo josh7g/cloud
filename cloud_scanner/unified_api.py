@@ -726,23 +726,52 @@ class UnifiedCloudAPI:
             import asyncio
             
             # Build validation kwargs based on provider
-            validation_kwargs = {
-                'credentials': credentials,
-                'account_id': account_id
-            }
-            
-            # Add provider-specific parameters
-            if provider == 'aws':
-                if role_arn:
-                    validation_kwargs['role_arn'] = role_arn
+            if provider == 'aws' and role_arn:
+                # For AWS role assumption, put role info in credentials dict
+                # to match existing validate_aws_credentials function signature
+                aws_credentials = credentials.copy()
+                aws_credentials['role_arn'] = role_arn
                 if external_id:
-                    validation_kwargs['external_id'] = external_id
+                    aws_credentials['external_id'] = external_id
+                
+                validation_kwargs = {
+                    'credentials': aws_credentials,
+                    'account_id': account_id
+                }
+            else:
+                # Standard validation
+                validation_kwargs = {
+                    'credentials': credentials,
+                    'account_id': account_id
+                }
             
             result = asyncio.run(validator(**validation_kwargs))
             
             # Return the validation result
-            # The validator should return a dict with 'success' and optionally 'error' or 'data'
+            # Convert AWS-specific format to unified API format if needed
             if isinstance(result, dict):
+                # Handle AWS-specific format: {'valid': bool} -> {'success': bool}
+                if 'valid' in result and 'success' not in result:
+                    if result['valid']:
+                        return jsonify({
+                            'success': True,
+                            'data': {
+                                'account_id': result.get('account_id'),
+                                'caller_identity': result.get('caller_identity'),
+                                'assumed_role': result.get('assumed_role')
+                            }
+                        }), 200
+                    else:
+                        return jsonify({
+                            'success': False,
+                            'error': {
+                                'message': 'Credential validation failed',
+                                'code': 'INVALID_CREDENTIALS',
+                                'details': ', '.join(result.get('errors', []))
+                            }
+                        }), 400
+                
+                # Standard unified API format
                 status_code = 200 if result.get('success') else 400
                 return jsonify(result), status_code
             else:
