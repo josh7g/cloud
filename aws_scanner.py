@@ -662,29 +662,37 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
         scan_id = scan_record.id
         logger.info(f"Created scan record with ID: {scan_id}")
         
-        # Run scan in background using asyncio task instead of thread
-        # This works better with gevent-patched environments
-        import asyncio
+        # Run scan in background using gevent greenlet
+        # This works natively with gevent's monkey patching
+        import gevent
         
-        async def run_scan_async():
-            """Run scan asynchronously"""
+        def run_scan_greenlet():
+            """Run scan in gevent greenlet"""
+            import asyncio
+            
             try:
-                # Create scanner instance with context manager
-                async with AwsSecurityScanner(db_session, scan_record) as scanner:
-                    # Run the scan
-                    await scanner.scan_account(
-                        user_id=user_id,
-                        account_id=account_id,
-                        credentials=credentials,
-                        scan_id=scan_id,
-                        cloudname=aws_cloudname
-                    )
+                # Create new event loop for this greenlet
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 
+                # Run the scan
+                async def run_scan():
+                    async with AwsSecurityScanner(db_session, scan_record) as scanner:
+                        await scanner.scan_account(
+                            user_id=user_id,
+                            account_id=account_id,
+                            credentials=credentials,
+                            scan_id=scan_id,
+                            cloudname=aws_cloudname
+                        )
+                
+                loop.run_until_complete(run_scan())
                 logger.info(f"Scan {scan_id} completed successfully")
                 
             except Exception as e:
-                logger.error(f"Background scan {scan_id} failed: {str(e)}")
+                logger.error(f"Greenlet scan {scan_id} failed: {str(e)}")
                 logger.error(traceback.format_exc())
+                
                 try:
                     scan_record.status = 'failed'
                     scan_record.error = str(e)
@@ -693,13 +701,15 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                     logger.error(f"Failed to update scan record: {str(commit_error)}")
             finally:
                 try:
+                    loop.close()
                     db_session.close()
                     engine.dispose()
                 except:
                     pass
         
-        # Schedule the async task in the current event loop
-        asyncio.create_task(run_scan_async())
+        # Spawn greenlet
+        gevent.spawn(run_scan_greenlet)
+        logger.info(f"Spawned greenlet for scan {scan_id}")
         
         # Return immediately with scan_id
         return {
