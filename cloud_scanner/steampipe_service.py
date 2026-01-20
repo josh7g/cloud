@@ -26,23 +26,32 @@ class SteampipeService:
         self.mod_dir.mkdir(exist_ok=True)
     
     async def _run_command(self, command: List[str], cwd: Optional[Path] = None, timeout: int = 300) -> str:
-        """Run a command and return its output with timeout"""
+        """Run a command and return its output with timeout - uses real subprocess to avoid gevent conflicts"""
         try:
             cmd_str = ' '.join(command)
             logger.debug(f"Running command: {cmd_str}")
             
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd) if cwd else None,
-                env=os.environ.copy()
-            )
+            # Import REAL subprocess (not gevent-patched version)
+            # This works because we're in a ThreadPool thread
+            import subprocess as real_subprocess
             
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                process.kill()
+                # Use real subprocess.run (blocking but we're in ThreadPool so it's OK)
+                result = real_subprocess.run(
+                    command,
+                    stdout=real_subprocess.PIPE,
+                    stderr=real_subprocess.PIPE,
+                    cwd=str(cwd) if cwd else None,
+                    env=os.environ.copy(),
+                    timeout=timeout,
+                    check=False  # Don't raise on non-zero exit
+                )
+                
+                stdout = result.stdout
+                stderr = result.stderr
+                returncode = result.returncode
+                
+            except real_subprocess.TimeoutExpired as e:
                 logger.error(f"Command timed out after {timeout} seconds: {cmd_str}")
                 raise RuntimeError(f"Command timed out after {timeout} seconds: {cmd_str}")
             
@@ -51,10 +60,10 @@ class SteampipeService:
                 if stderr_text.strip():
                     logger.debug(f"Command stderr: {stderr_text}")
             
-            if process.returncode != 0:
+            if returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown error"
-                logger.error(f"Command failed with code {process.returncode}: {error_msg}")
-                raise RuntimeError(f"Command failed with code {process.returncode}: {error_msg}")
+                logger.error(f"Command failed with code {returncode}: {error_msg}")
+                raise RuntimeError(f"Command failed with code {returncode}: {error_msg}")
             
             output = stdout.decode() if stdout else ""
             return output
@@ -155,37 +164,41 @@ class SteampipeService:
             return None
     
     async def _run_command_with_debug(self, command: List[str], cwd: Optional[Path] = None, timeout: int = 300) -> str:
-        """Run command with debug output handling"""
+        """Run command with debug output handling - uses real subprocess"""
         try:
             cmd_str = ' '.join(command)
             logger.debug(f"Running command with debug: {cmd_str}")
             
+            # Import real subprocess
+            import subprocess as real_subprocess
+            import time
+            
             # For benchmark commands, use file redirection for large outputs
             if 'benchmark run' in cmd_str and '--output json' in cmd_str:
-                output_file = self.workspace_dir / f"benchmark_output_{int(asyncio.get_event_loop().time())}.json"
+                output_file = self.workspace_dir / f"benchmark_output_{int(time.time())}.json"
                 
-                # Use shell to allow redirection
+                # Use shell to allow redirection with REAL subprocess
                 redirect_cmd = f"{' '.join(command)} > {output_file}"
                 
-                process = await asyncio.create_subprocess_shell(
-                    redirect_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(cwd) if cwd else None,
-                    env=os.environ.copy(),
-                    shell=True
-                )
-                
                 try:
-                    _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    process.kill()
+                    result = real_subprocess.run(
+                        redirect_cmd,
+                        stdout=real_subprocess.PIPE,
+                        stderr=real_subprocess.PIPE,
+                        cwd=str(cwd) if cwd else None,
+                        env=os.environ.copy(),
+                        shell=True,
+                        timeout=timeout,
+                        check=False
+                    )
+                    
+                    if result.stderr:
+                        stderr_text = result.stderr.decode()
+                        if stderr_text:
+                            logger.error(f"Command stderr: {stderr_text}")
+                    
+                except real_subprocess.TimeoutExpired:
                     raise RuntimeError(f"Command timed out after {timeout} seconds")
-                
-                if stderr:
-                    stderr_text = stderr.decode()
-                    if stderr_text:
-                        logger.error(f"Command stderr: {stderr_text}")
                 
                 if os.path.exists(output_file):
                     with open(output_file, 'r') as f:
@@ -280,4 +293,3 @@ STEAMPIPE_CONFIGS = {
         'default_benchmark': 'gcp_compliance.benchmark.cis_v100'
     }
 }
-
