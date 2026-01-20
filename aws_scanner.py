@@ -662,15 +662,15 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
         scan_id = scan_record.id
         logger.info(f"Created scan record with ID: {scan_id}")
         
-        # Run scan in background thread (like old AWS API)
-        # Create thread BEFORE any async operations to avoid gevent issues
-        import threading
+        # Run scan in background using gevent ThreadPool
+        # ThreadPool creates threads isolated from gevent's patches
+        from gevent.threadpool import ThreadPool
         
-        def run_scan_in_background():
-            """Run scan in background thread with its own event loop"""
+        def run_scan_in_thread():
+            """Run scan in isolated thread (not gevent-patched)"""
             import asyncio
             
-            # Create new event loop for this thread
+            # Create new event loop for this thread (works because ThreadPool is isolated)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
@@ -691,7 +691,7 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                 logger.info(f"Scan {scan_id} completed successfully")
                 
             except Exception as e:
-                logger.error(f"Background scan {scan_id} failed: {str(e)}")
+                logger.error(f"Thread scan {scan_id} failed: {str(e)}")
                 logger.error(traceback.format_exc())
                 
                 try:
@@ -708,11 +708,10 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                 except:
                     pass
         
-        # Start background thread
-        thread = threading.Thread(target=run_scan_in_background)
-        thread.daemon = True
-        thread.start()
-        logger.info(f"Started background thread for scan {scan_id}")
+        # Create thread pool and spawn
+        pool = ThreadPool(maxsize=1)
+        pool.spawn(run_scan_in_thread)
+        logger.info(f"Spawned isolated thread for scan {scan_id}")
         
         # Return immediately with scan_id
         return {
