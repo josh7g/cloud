@@ -662,20 +662,20 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
         scan_id = scan_record.id
         logger.info(f"Created scan record with ID: {scan_id}")
         
-        # Run scan in background using gevent greenlet
-        # This works natively with gevent's monkey patching
-        import gevent
+        # Run scan in background thread (like old AWS API)
+        # Create thread BEFORE any async operations to avoid gevent issues
+        import threading
         
-        def run_scan_greenlet():
-            """Run scan in gevent greenlet"""
+        def run_scan_in_background():
+            """Run scan in background thread with its own event loop"""
             import asyncio
             
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
             try:
-                # Create new event loop for this greenlet
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # Run the scan
+                # Define async scan function
                 async def run_scan():
                     async with AwsSecurityScanner(db_session, scan_record) as scanner:
                         await scanner.scan_account(
@@ -686,11 +686,12 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                             cloudname=aws_cloudname
                         )
                 
+                # Run the scan
                 loop.run_until_complete(run_scan())
                 logger.info(f"Scan {scan_id} completed successfully")
                 
             except Exception as e:
-                logger.error(f"Greenlet scan {scan_id} failed: {str(e)}")
+                logger.error(f"Background scan {scan_id} failed: {str(e)}")
                 logger.error(traceback.format_exc())
                 
                 try:
@@ -707,9 +708,11 @@ async def scan_aws_account_handler(request_data: Dict[str, Any]) -> Dict[str, An
                 except:
                     pass
         
-        # Spawn greenlet
-        gevent.spawn(run_scan_greenlet)
-        logger.info(f"Spawned greenlet for scan {scan_id}")
+        # Start background thread
+        thread = threading.Thread(target=run_scan_in_background)
+        thread.daemon = True
+        thread.start()
+        logger.info(f"Started background thread for scan {scan_id}")
         
         # Return immediately with scan_id
         return {
